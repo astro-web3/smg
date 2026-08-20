@@ -1,4 +1,5 @@
 use std::{
+    io,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -52,15 +53,20 @@ use crate::{
     observability::{
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
-        metrics_server, otel_trace, runtime_metrics,
+        metrics_server, otel_trace,
+        pd_request_lifecycle::{PdLifecycleConfig, PdResponseAttribution},
+        runtime_metrics,
     },
     routers::{
-        common::realtime::ws::RealtimeQueryParams, conversations, parse,
+        common::realtime::ws::RealtimeQueryParams, conversations, error as router_error, parse,
         responses as response_handlers, router_manager::RouterManager, tokenize, RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
-    worker::manager::{WorkerManager, WorkerManagerConfig},
+    worker::{
+        manager::{WorkerManager, WorkerManagerConfig},
+        ConnectionMode,
+    },
     workflow::{
         job_queue::{JobQueue, JobQueueConfig},
         Job, TokenizerConfigRequest, WorkflowEngines,
@@ -74,10 +80,57 @@ pub struct AppState {
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_adapters: Option<Arc<MeshAdapters>>,
+    /// HTTP-only PD lifecycle identity and trusted probe-route catalog.
+    /// `None` keeps the internal prober path fail-closed.
+    pub pd_probe_lifecycle_config: Option<Arc<PdLifecycleConfig>>,
     /// Cached O(1) readiness state shared with the optional dedicated
     /// probe listener. Maintained event-driven by
     /// [`crate::health::spawn_readiness_maintainer`].
     pub probe_state: Arc<crate::health::ProbeState>,
+}
+
+const INTERNAL_PD_PROBE_ROUTE_IDENTITY: &str = "internal-probe-v1";
+const INTERNAL_PD_PROBE_CHAT_PATH: &str = "/internal/pd-probe/v1/chat/completions";
+const PD_CHAT_CANONICAL_ENDPOINT: &str = "/v1/chat/completions";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InternalPdProbeAuthorizationError {
+    Disabled,
+    Rejected,
+}
+
+impl InternalPdProbeAuthorizationError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Disabled => {
+                router_error::not_found("pd_probe_disabled", "PD internal probe route is disabled")
+            }
+            Self::Rejected => router_error::create_error(
+                StatusCode::FORBIDDEN,
+                "pd_probe_route_rejected",
+                "PD internal probe route is not authorized",
+            ),
+        }
+    }
+}
+
+fn authorize_internal_pd_probe_request(
+    config: Option<&PdLifecycleConfig>,
+    tenant_meta: middleware::TenantRequestMeta,
+    headers: &HeaderMap,
+) -> Result<middleware::TenantRequestMeta, InternalPdProbeAuthorizationError> {
+    let Some(config) = config else {
+        return Err(InternalPdProbeAuthorizationError::Disabled);
+    };
+    let route_identity = config
+        .authorize_trusted_http_route(
+            &tenant_meta,
+            INTERNAL_PD_PROBE_ROUTE_IDENTITY,
+            PD_CHAT_CANONICAL_ENDPOINT,
+            headers,
+        )
+        .map_err(|_| InternalPdProbeAuthorizationError::Rejected)?;
+    Ok(tenant_meta.with_extension(route_identity))
 }
 
 async fn parse_function_call(
@@ -160,13 +213,66 @@ async fn v1_chat_completions(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
-    cancel
+    let mut response = cancel
         .guard(
             state
                 .router
                 .route_chat(Some(&headers), &tenant_meta, &body, &body.model),
         )
-        .await
+        .await;
+    PdResponseAttribution::strip_internal_probe_headers(response.headers_mut());
+    response
+}
+
+/// Authenticated, opt-in HTTP probe surface. The normal auth and tenant
+/// resolution layers run first; this handler then adds the server-owned route
+/// marker only when the active versioned catalog authorizes the exact
+/// principal and canonical chat endpoint.
+async fn internal_pd_probe_v1_chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+) -> Response {
+    let tenant_meta = match authorize_internal_pd_probe_request(
+        state.pd_probe_lifecycle_config.as_deref(),
+        tenant_meta,
+        &headers,
+    ) {
+        Ok(tenant_meta) => tenant_meta,
+        Err(error) => return error.into_response(),
+    };
+    let mut response = cancel
+        .guard(
+            state
+                .router
+                .route_chat(Some(&headers), &tenant_meta, &body, &body.model),
+        )
+        .await;
+
+    let Some(attribution) = response
+        .extensions()
+        .get::<PdResponseAttribution>()
+        .cloned()
+    else {
+        return router_error::bad_gateway(
+            "pd_probe_attribution_missing",
+            "PD probe response is missing trusted release attribution",
+        );
+    };
+    let attribution_headers = match attribution.to_internal_probe_headers() {
+        Ok(headers) => headers,
+        Err(_) => {
+            return router_error::bad_gateway(
+                "pd_probe_attribution_invalid",
+                "PD probe response contains invalid trusted release attribution",
+            )
+        }
+    };
+    PdResponseAttribution::strip_internal_probe_headers(response.headers_mut());
+    response.headers_mut().extend(attribution_headers);
+    response
 }
 
 async fn v1_completions(
@@ -802,6 +908,10 @@ pub fn build_app(
             ))
             .route("/generate", post(generate))
             .route("/v1/chat/completions", post(v1_chat_completions))
+            .route(
+                INTERNAL_PD_PROBE_CHAT_PATH,
+                post(internal_pd_probe_v1_chat_completions),
+            )
             .route("/v1/completions", post(v1_completions))
             .route("/rerank", post(rerank))
             .route("/v1/rerank", post(v1_rerank))
@@ -1287,6 +1397,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         info!("Probe listener started on {probe_addr} (--health-check-port {probe_port})");
     }
 
+    let pd_probe_lifecycle_config = if config.router_config.mode.is_pd_mode()
+        && config.router_config.connection_mode == ConnectionMode::Http
+    {
+        PdLifecycleConfig::from_env()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+            .map(Arc::new)
+    } else {
+        None
+    };
+
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
@@ -1294,6 +1414,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         router_manager: Some(router_manager),
         mesh_handler,
         mesh_adapters,
+        pd_probe_lifecycle_config,
         probe_state,
     });
     if let Some(service_discovery_config) = config.service_discovery_config {
@@ -1521,4 +1642,131 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use axum::http::HeaderValue;
+
+    use super::*;
+    use crate::{
+        observability::pd_request_lifecycle::PdTrustedRouteIdentity,
+        tenant::{RouteRequestMeta, TenantKey},
+    };
+
+    fn probe_config() -> PdLifecycleConfig {
+        let principal = format!("auth:{}", "1".repeat(64));
+        let request_catalog = serde_json::json!({
+            "version": "request-class-v1",
+            "privileged_routes": {
+                "internal-probe-v1": {
+                    "authenticated_principal": principal,
+                    "endpoint": "/v1/chat/completions",
+                    "traffic_class": "synthetic",
+                    "workload_bucket": "probe-2k-v1",
+                    "pd_service": "glm52",
+                    "smg_release": "stable",
+                    "release_generation": "release-v7",
+                    "membership_checksum": "c".repeat(64),
+                    "cache_domains": ["cache-a", "cache-b"]
+                }
+            }
+        })
+        .to_string();
+        let cohort_catalog = serde_json::json!({
+            "version": "cohort-pair-v1",
+            "pairs": {
+                "p-v1_d-v1": {
+                    "cache_domain": "cache-a",
+                    "prefill_runtime_cohort": "p-v1",
+                    "decode_runtime_cohort": "d-v1"
+                }
+            }
+        })
+        .to_string();
+        let values = HashMap::from([
+            ("SMG_PD_ENVIRONMENT", "test".to_string()),
+            ("SMG_PD_SERVICE", "glm52".to_string()),
+            ("SMG_PD_RELEASE", "stable".to_string()),
+            (
+                "SMG_PD_METRIC_CONTRACT_VERSION",
+                "smg-pd-request-v1".to_string(),
+            ),
+            ("SMG_PD_SCHEMA_DIGEST", "a".repeat(64)),
+            ("SMG_PD_IMAGE_DIGEST", format!("sha256:{}", "b".repeat(64))),
+            (
+                "SMG_PD_PRODUCER_REVISION",
+                "0744ea180744ea180744ea180744ea180744ea18".to_string(),
+            ),
+            ("SMG_PD_REQUEST_CLASS_CATALOG_JSON", request_catalog),
+            ("SMG_PD_COHORT_CATALOG_JSON", cohort_catalog),
+        ]);
+        PdLifecycleConfig::from_lookup(|key| values.get(key).cloned())
+            .expect("valid config")
+            .expect("enabled config")
+    }
+
+    #[test]
+    fn internal_pd_probe_route_is_disabled_without_lifecycle_catalog() {
+        let tenant = RouteRequestMeta::new(TenantKey::from("anonymous"));
+        let error = authorize_internal_pd_probe_request(None, tenant, &HeaderMap::new())
+            .expect_err("route must fail closed");
+        assert_eq!(error, InternalPdProbeAuthorizationError::Disabled);
+    }
+
+    #[test]
+    fn internal_pd_probe_route_injects_server_owned_identity_for_exact_principal() {
+        let config = probe_config();
+        let tenant = RouteRequestMeta::new(TenantKey::new(format!("auth:{}", "1".repeat(64))));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-pd-probe-cache-domain",
+            HeaderValue::from_static("cache-a"),
+        );
+        let authorized = authorize_internal_pd_probe_request(Some(&config), tenant, &headers)
+            .expect("catalogued probe route");
+
+        assert_eq!(
+            authorized.extension::<PdTrustedRouteIdentity>(),
+            Some(
+                &PdTrustedRouteIdentity::new(INTERNAL_PD_PROBE_ROUTE_IDENTITY)
+                    .expect("fixed route identity")
+            )
+        );
+    }
+
+    #[test]
+    fn internal_pd_probe_route_rejects_non_catalogued_authenticated_principal() {
+        let config = probe_config();
+        let tenant = RouteRequestMeta::new(TenantKey::new(format!("auth:{}", "2".repeat(64))));
+        let error = authorize_internal_pd_probe_request(Some(&config), tenant, &HeaderMap::new())
+            .expect_err("wrong principal must not gain the route marker");
+        assert_eq!(error, InternalPdProbeAuthorizationError::Rejected);
+    }
+
+    #[test]
+    fn internal_pd_probe_route_rejects_unknown_cache_domain() {
+        let config = probe_config();
+        let tenant = RouteRequestMeta::new(TenantKey::new(format!("auth:{}", "1".repeat(64))));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-pd-probe-cache-domain",
+            HeaderValue::from_static("cache-unknown"),
+        );
+
+        let error = authorize_internal_pd_probe_request(Some(&config), tenant, &headers)
+            .expect_err("unknown cache domain must fail closed");
+        assert_eq!(error, InternalPdProbeAuthorizationError::Rejected);
+    }
+
+    #[test]
+    fn internal_pd_probe_route_requires_cache_domain() {
+        let config = probe_config();
+        let tenant = RouteRequestMeta::new(TenantKey::new(format!("auth:{}", "1".repeat(64))));
+        let error = authorize_internal_pd_probe_request(Some(&config), tenant, &HeaderMap::new())
+            .expect_err("missing cache domain must fail closed");
+        assert_eq!(error, InternalPdProbeAuthorizationError::Rejected);
+    }
 }

@@ -107,6 +107,7 @@ pub fn create_test_app(
         router_manager: None,
         mesh_handler: None,
         mesh_adapters: None,
+        pd_probe_lifecycle_config: None,
     });
 
     // Configure request ID headers (use defaults if not specified)
@@ -167,6 +168,7 @@ pub fn create_test_app_with_context(
         router_manager: None,
         mesh_handler: None,
         mesh_adapters: None,
+        pd_probe_lifecycle_config: None,
     });
 
     // Get config from the context

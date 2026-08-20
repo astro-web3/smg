@@ -228,6 +228,46 @@ pub(crate) fn init_metrics() {
         "PD KV-transfer failures (missing connector params at decode handoff)"
     );
 
+    // Service-level PD request lifecycle. These families intentionally do not
+    // reuse worker/transport metrics: one client request is counted once even
+    // though both Prefill and Decode execute work.
+    describe_gauge!(
+        "smg_pd_request_lifecycle_contract_info",
+        "Zero-traffic PD request-lifecycle capability anchor"
+    );
+    describe_counter!(
+        "smg_pd_requests_started_total",
+        "PD service requests accepted by the Router"
+    );
+    describe_counter!(
+        "smg_pd_terminal_requests_total",
+        "PD service requests reaching one final terminal outcome"
+    );
+    describe_counter!(
+        "smg_pd_request_metric_evidence_total",
+        "Known or unknown evidence for each PD request metric"
+    );
+    describe_histogram!(
+        "smg_pd_request_v1_ttft_seconds",
+        "PD service time from request start to first emitted output token"
+    );
+    describe_histogram!(
+        "smg_pd_tpot_seconds",
+        "PD service time per output token using first-to-last divided by N-1"
+    );
+    describe_histogram!(
+        "smg_pd_e2e_seconds",
+        "PD service request time through terminal stream completion"
+    );
+    describe_counter!(
+        "smg_pd_completed_input_tokens_total",
+        "Validated input tokens from terminal PD service usage"
+    );
+    describe_counter!(
+        "smg_pd_completed_output_tokens_total",
+        "Validated output tokens from terminal PD service usage"
+    );
+
     // Layer 3: Worker metrics
     describe_gauge!(
         "smg_worker_pool_size",
@@ -2054,7 +2094,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_pd_ttft_emits_histogram() {
+    fn test_record_pd_ttft_preserves_the_preexisting_transport_family() {
         let (rendered, ()) = with_test_recorder(|| {
             Metrics::record_pd_ttft(
                 metrics_labels::BACKEND_PD,

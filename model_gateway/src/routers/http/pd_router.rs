@@ -1,4 +1,9 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -8,8 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use futures_util::StreamExt;
-use memchr::memmem;
+use futures_util::{Stream, StreamExt};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{InputIds, StringOrArray},
@@ -21,7 +25,7 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -31,6 +35,10 @@ use crate::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
+        pd_request_lifecycle::{
+            PdLifecycleConfig, PdRequestLifecycle, PdResponseAttribution, PdSseParser,
+            PdStreamCancellationGuard, PdTerminalOutcome,
+        },
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     routers::{
@@ -46,6 +54,8 @@ use crate::{
     worker::{HashRing, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
+const MAX_PD_SSE_EVENTS_PER_CHUNK: usize = 128;
+
 #[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
@@ -53,6 +63,7 @@ pub struct PDRouter {
     pub client: Client,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
+    pub pd_lifecycle_config: Option<Arc<PdLifecycleConfig>>,
 }
 
 #[derive(Clone)]
@@ -66,7 +77,103 @@ struct PDRequestContext<'a> {
     headers: Option<HeaderMap>,
 }
 
+enum PdRelayEvent {
+    Data {
+        result: Result<Bytes, String>,
+        observed_events: Vec<Value>,
+        observation_overflowed: bool,
+    },
+    Terminal(PdTerminalOutcome),
+}
+
+/// Defers the lifecycle terminal transition until the downstream HTTP body
+/// consumes the relay's terminal marker. Upstream completion alone is not
+/// enough to claim that the Router finished serving the response body.
+struct PdLifecycleRelayStream {
+    receiver: ReceiverStream<PdRelayEvent>,
+    request: Option<Arc<PdRequestLifecycle>>,
+    status: StatusCode,
+    terminal: bool,
+}
+
+impl PdLifecycleRelayStream {
+    fn new(
+        receiver: mpsc::Receiver<PdRelayEvent>,
+        request: Option<Arc<PdRequestLifecycle>>,
+        status: StatusCode,
+    ) -> Self {
+        Self {
+            receiver: ReceiverStream::new(receiver),
+            request,
+            status,
+            terminal: false,
+        }
+    }
+
+    fn finish(&mut self, outcome: PdTerminalOutcome) {
+        if let Some(request) = self.request.take() {
+            request.finish_stream(outcome, self.status);
+        }
+        self.terminal = true;
+    }
+}
+
+impl Stream for PdLifecycleRelayStream {
+    type Item = Result<Bytes, String>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminal {
+            return Poll::Ready(None);
+        }
+
+        match Pin::new(&mut self.receiver).poll_next(cx) {
+            Poll::Ready(Some(PdRelayEvent::Data {
+                result,
+                observed_events,
+                observation_overflowed,
+            })) => {
+                if let Some(request) = self.request.as_ref() {
+                    if observation_overflowed {
+                        request.mark_observation_overflowed();
+                    }
+                    for value in observed_events {
+                        request.observe_json(&value);
+                    }
+                }
+                if result.is_err() {
+                    self.finish(PdTerminalOutcome::Error);
+                }
+                Poll::Ready(Some(result))
+            }
+            Poll::Ready(Some(PdRelayEvent::Terminal(outcome))) => {
+                self.finish(outcome);
+                Poll::Ready(None)
+            }
+            Poll::Ready(None) => {
+                // A relay task that exits without its terminal marker is an
+                // internal partial-stream failure, never success.
+                self.finish(PdTerminalOutcome::Error);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 impl PDRouter {
+    fn finalize_pd_response(
+        response: &mut Response,
+        response_attribution: Option<PdResponseAttribution>,
+    ) {
+        // Worker-controlled headers must never cross a public PD response
+        // boundary. The internal probe handler reads the trusted extension,
+        // strips once more defensively, and then writes server-owned values.
+        PdResponseAttribution::strip_internal_probe_headers(response.headers_mut());
+        if let Some(attribution) = response_attribution {
+            response.extensions_mut().insert(attribution);
+        }
+    }
+
     async fn proxy_to_first_prefill_worker(
         &self,
         endpoint: &str,
@@ -106,6 +213,7 @@ impl PDRouter {
                         let mut response = Response::new(Body::from(body));
                         *response.status_mut() = StatusCode::OK;
                         *response.headers_mut() = response_headers;
+                        Self::finalize_pd_response(&mut response, None);
                         response
                     }
                     Err(e) => {
@@ -163,12 +271,17 @@ impl PDRouter {
         reason = "async for API consistency with other router constructors"
     )]
     pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+        let pd_lifecycle_config = PdLifecycleConfig::from_env()?.map(Arc::new);
+        if let Some(config) = pd_lifecycle_config.as_ref() {
+            config.install_capability_anchor();
+        }
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
             client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
+            pd_lifecycle_config,
         })
     }
 
@@ -285,6 +398,7 @@ impl PDRouter {
     async fn execute_dual_dispatch<T: Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
+        request_meta: &TenantRequestMeta,
         original_request: &T,
         context: PDRequestContext<'_>,
     ) -> Response {
@@ -293,6 +407,31 @@ impl PDRouter {
         let route = context.route;
         let model = context.model_id;
         let endpoint = route_to_endpoint(route);
+        let is_stream = context.is_stream;
+        let request_lifecycle = if let Some(config) = self.pd_lifecycle_config.as_ref() {
+            let classification =
+                match config.classify_public_http_request(request_meta, context.route, headers) {
+                    Ok(classification) => classification,
+                    Err(message) => {
+                        return error::create_error(
+                            StatusCode::FORBIDDEN,
+                            "pd_request_class_rejected",
+                            message,
+                        );
+                    }
+                };
+            Some(PdRequestLifecycle::start_classified(
+                Arc::clone(config),
+                classification,
+            ))
+        } else {
+            None
+        };
+        let response_attribution = request_lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.response_attribution())
+            .cloned();
+        let retry_lifecycle = request_lifecycle.clone();
 
         // Record request start (Layer 2)
         Metrics::record_router_request(
@@ -313,19 +452,28 @@ impl PDRouter {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
-        let response = RetryExecutor::execute_response_with_retry(
+        let mut response = RetryExecutor::execute_response_with_retry(
             retry_config,
             {
                 move |attempt: u32| {
                     // Clone Arc (cheap reference count increment) instead of cloning the entire request
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
+                    let request_lifecycle = retry_lifecycle.clone();
                     async move {
+                        if let Some(lifecycle) = request_lifecycle.as_ref() {
+                            lifecycle.begin_unassigned_attempt();
+                        }
+                        let required_cache_domain = request_lifecycle
+                            .as_ref()
+                            .and_then(|lifecycle| lifecycle.response_attribution())
+                            .map(|attribution| attribution.cache_domain());
                         let (prefill, decode) = match self
                             .select_pd_pair(
                                 context.request_text.as_deref(),
                                 context.model_id,
                                 context.headers.as_ref(),
+                                required_cache_domain,
                             )
                             .await
                         {
@@ -334,6 +482,18 @@ impl PDRouter {
                                 return Self::handle_server_selection_error(e);
                             }
                         };
+
+                        if let Some(lifecycle) = request_lifecycle.as_ref() {
+                            if let Err(message) =
+                                lifecycle.begin_selected_attempt(prefill.as_ref(), decode.as_ref())
+                            {
+                                return error::create_error(
+                                    StatusCode::BAD_GATEWAY,
+                                    "pd_attribution_mismatch",
+                                    message,
+                                );
+                            }
+                        }
 
                         debug!(
                             "PD retry attempt {} using prefill={} decode={}",
@@ -425,6 +585,7 @@ impl PDRouter {
                                 context,
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
+                                request_lifecycle,
                             )
                             .await;
 
@@ -487,6 +648,24 @@ impl PDRouter {
             );
         }
 
+        // Successful streams finish in the body relay, where completion,
+        // partial-stream failure, and client cancellation are observable. All
+        // other responses are complete here after the final retry attempt.
+        if let Some(lifecycle) = request_lifecycle {
+            if !is_stream || !response.status().is_success() {
+                let outcome = if response.status().is_success() {
+                    PdTerminalOutcome::Success
+                } else {
+                    PdTerminalOutcome::Error
+                };
+                lifecycle.finish_stream(outcome, response.status());
+            }
+        }
+
+        // Keep attribution server-side while stripping every worker-supplied
+        // internal header at the shared PD response boundary.
+        Self::finalize_pd_response(&mut response, response_attribution);
+
         response
     }
 
@@ -530,6 +709,7 @@ impl PDRouter {
                 Some(decode_url),
                 Some(response_headers),
                 load_guards,
+                None,
             )
         } else {
             // Handle non-streaming error response
@@ -604,6 +784,10 @@ impl PDRouter {
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "PD dispatch needs both leg requests, selected workers, and one lifecycle"
+    )]
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
@@ -612,6 +796,7 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        request_lifecycle: Option<Arc<PdRequestLifecycle>>,
     ) -> Response {
         let load_guards = vec![
             WorkerLoadGuard::new(prefill.clone(), headers),
@@ -754,6 +939,7 @@ impl PDRouter {
                 None,
                 Some(response_headers),
                 load_guards,
+                request_lifecycle,
             )
         } else {
             // Non-streaming response
@@ -763,6 +949,7 @@ impl PDRouter {
                     status,
                     context.return_logprob,
                     prefill_body,
+                    request_lifecycle.as_ref(),
                 )
                 .await
             } else {
@@ -772,6 +959,7 @@ impl PDRouter {
 
                 match decode_response.bytes().await {
                     Ok(decode_body) => {
+                        Self::observe_pd_response_body(request_lifecycle.as_ref(), &decode_body);
                         let mut response = Response::new(Body::from(decode_body));
                         *response.status_mut() = status;
                         *response.headers_mut() = response_headers;
@@ -801,6 +989,7 @@ impl PDRouter {
         request_text: Option<&str>,
         model_id: &str,
         headers: Option<&HeaderMap>,
+        required_cache_domain: Option<&str>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         debug!("Selecting PD pair: model_id={:?}", model_id);
 
@@ -814,12 +1003,25 @@ impl PDRouter {
                 .filter(|w| matches!(w.worker_type(), WorkerType::Prefill))
                 .cloned()
                 .collect();
-            if by_model.is_empty() && is_unknown_model {
+            let workers = if by_model.is_empty() && is_unknown_model {
                 // "auto" means pick any — fall back to all prefill workers
                 self.worker_registry.get_prefill_workers().to_vec()
             } else {
                 by_model
-            }
+            };
+            workers
+                .into_iter()
+                .filter(|worker| {
+                    required_cache_domain.is_none_or(|required| {
+                        worker
+                            .metadata()
+                            .spec
+                            .labels
+                            .get("cache_domain")
+                            .is_some_and(|actual| actual == required)
+                    })
+                })
+                .collect::<Vec<_>>()
         };
 
         let decode_workers = {
@@ -853,6 +1055,30 @@ impl PDRouter {
             "prefill",
             crate::policies::WorkerLeg::Prefill,
         )?;
+
+        let decode_workers = if required_cache_domain.is_some() {
+            let pair_id = prefill
+                .metadata()
+                .spec
+                .labels
+                .get("execution_cohort_pair_id")
+                .ok_or_else(|| {
+                    "Selected prefill worker is missing execution_cohort_pair_id".to_string()
+                })?;
+            decode_workers
+                .into_iter()
+                .filter(|worker| {
+                    worker
+                        .metadata()
+                        .spec
+                        .labels
+                        .get("execution_cohort_pair_id")
+                        == Some(pair_id)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            decode_workers
+        };
 
         let decode = self.pick_worker_by_policy_arc(
             &decode_workers,
@@ -945,17 +1171,24 @@ impl PDRouter {
     )]
     fn create_streaming_response(
         &self,
-        stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
         status: StatusCode,
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         decode_url: Option<String>,
         headers: Option<HeaderMap>,
         load_guards: Vec<WorkerLoadGuard>,
+        request_lifecycle: Option<Arc<PdRequestLifecycle>>,
     ) -> Response {
         use crate::worker::AttachedBody;
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        // Keep upstream reads close to downstream body consumption. Besides
+        // bounding memory, this prevents a fast Decode from racing arbitrarily
+        // far ahead of a slow or disconnected client.
+        let (tx, rx) = mpsc::channel(8);
+        let cancellation_guard = PdStreamCancellationGuard::new(request_lifecycle.clone(), status);
+        let observe_lifecycle = request_lifecycle.is_some();
+        let merge_logprobs = return_logprob && prefill_logprobs.is_some();
 
         #[expect(
             clippy::disallowed_methods,
@@ -963,24 +1196,36 @@ impl PDRouter {
         )]
         tokio::spawn(async move {
             futures_util::pin_mut!(stream);
+            let mut terminal_outcome = PdTerminalOutcome::Error;
+            let mut sse_parser = PdSseParser::default();
             // Reusable SSE encoder for the logprob-merge re-encode path.
             let mut encoder = SseEncoder::new();
-            // Whether the next chunk begins at an SSE line boundary (i.e. the
-            // previous chunk ended with an EOL); used to anchor the [DONE]
-            // sentinel detection when the match sits at the start of a chunk.
-            let mut at_line_start = true;
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
-                        if let Some(&last) = chunk.last() {
-                            at_line_start = last == b'\n' || last == b'\r';
-                        }
+                        let mut observed_events = Vec::new();
+                        let mut observation_overflowed = false;
+                        let event_was_pending = sse_parser.has_pending_event();
+                        let parse_state = sse_parser.observe_chunk(&chunk, |value| {
+                            if observe_lifecycle || merge_logprobs {
+                                if observed_events.len() < MAX_PD_SSE_EVENTS_PER_CHUNK {
+                                    observed_events.push(value);
+                                } else {
+                                    observation_overflowed = true;
+                                }
+                            }
+                        });
+                        observation_overflowed |= parse_state.buffer_overflowed;
 
-                        let result = if return_logprob && prefill_logprobs.is_some() {
+                        let result = if merge_logprobs && !observation_overflowed {
+                            let event = if !event_was_pending && observed_events.len() == 1 {
+                                observed_events.first_mut()
+                            } else {
+                                None
+                            };
                             Self::merge_streaming_logprobs(
                                 prefill_logprobs.as_ref(),
-                                &chunk,
+                                event,
                                 &mut encoder,
                             )
                             .unwrap_or(chunk)
@@ -988,11 +1233,25 @@ impl PDRouter {
                             chunk
                         };
 
-                        if tx.send(Ok(result)).is_err() {
+                        if tx
+                            .send(PdRelayEvent::Data {
+                                result: Ok(result),
+                                observed_events,
+                                observation_overflowed,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            terminal_outcome = PdTerminalOutcome::Cancel;
                             break;
                         }
 
-                        if is_done {
+                        if parse_state.done {
+                            terminal_outcome = if parse_state.application_error_seen {
+                                PdTerminalOutcome::Error
+                            } else {
+                                PdTerminalOutcome::Success
+                            };
                             break;
                         }
                     }
@@ -1000,14 +1259,21 @@ impl PDRouter {
                         if let Some(ref url) = decode_url {
                             error!("Stream error from decode server {}: {}", url, e);
                         }
-                        let _ = tx.send(Err(format!("Stream error: {e}")));
+                        let _ = tx
+                            .send(PdRelayEvent::Data {
+                                result: Err(format!("Stream error: {e}")),
+                                observed_events: Vec::new(),
+                                observation_overflowed: false,
+                            })
+                            .await;
                         break;
                     }
                 }
             }
+            let _ = tx.send(PdRelayEvent::Terminal(terminal_outcome)).await;
         });
 
-        let stream = UnboundedReceiverStream::new(rx);
+        let stream = PdLifecycleRelayStream::new(rx, request_lifecycle, status);
         let body = Body::from_stream(stream);
 
         let mut response = Response::new(body);
@@ -1017,7 +1283,7 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
-        AttachedBody::wrap_response(response, load_guards)
+        AttachedBody::wrap_response(response, (load_guards, cancellation_guard))
     }
 
     /// Build a non-streaming PD response with `Content-Type: application/json`.
@@ -1040,6 +1306,7 @@ impl PDRouter {
         status: StatusCode,
         return_logprob: bool,
         prefill_body: Option<Bytes>,
+        request_lifecycle: Option<&Arc<PdRequestLifecycle>>,
     ) -> Response {
         let response = res.bytes().await;
         let decode_body = match response {
@@ -1049,6 +1316,7 @@ impl PDRouter {
                 return error::internal_error("read_response_failed", "Failed to read response");
             }
         };
+        Self::observe_pd_response_body(request_lifecycle, &decode_body);
 
         if !return_logprob {
             return Self::non_stream_pd_json_response(status, decode_body);
@@ -1076,6 +1344,14 @@ impl PDRouter {
                 error!("Failed to serialize merged response: {}", e);
                 Self::non_stream_pd_json_response(status, decode_body)
             }
+        }
+    }
+
+    fn observe_pd_response_body(request_lifecycle: Option<&Arc<PdRequestLifecycle>>, body: &[u8]) {
+        if let (Some(lifecycle), Ok(value)) =
+            (request_lifecycle, serde_json::from_slice::<Value>(body))
+        {
+            lifecycle.observe_non_stream_json(&value);
         }
     }
 
@@ -1212,71 +1488,14 @@ impl PDRouter {
         false
     }
 
-    /// Line-anchored detection of the SSE `data: [DONE]` terminal event in a
-    /// raw upstream chunk: a match must start at a line boundary and be
-    /// immediately followed by a complete empty-line event delimiter within
-    /// the same chunk. Payload text that merely contains those bytes never
-    /// qualifies — real EOL bytes cannot occur inside a `data:` payload
-    /// (JSON escapes them). Requiring the full delimiter also rejects
-    /// multi-line events like `data: [DONE]\ndata: x\n\n`, whose joined data
-    /// is not exactly `[DONE]`.
-    ///
-    /// `at_line_start` says whether `chunk` begins at a line boundary. A
-    /// sentinel or delimiter split across chunks is never treated as
-    /// terminal — every byte is still forwarded and the relay then ends via
-    /// upstream EOF, so deferring is always safe while a false positive
-    /// kills a live stream.
-    fn chunk_contains_done_event(chunk: &[u8], at_line_start: bool) -> bool {
-        const DONE_EVENT: &[u8] = b"data: [DONE]";
-        // Length of the EOL sequence at `bytes[pos..]`: 2 for \r\n, 1 for a
-        // bare \r or \n, 0 if none.
-        fn eol_len_at(bytes: &[u8], pos: usize) -> usize {
-            match bytes.get(pos) {
-                Some(b'\r') => 1 + usize::from(bytes.get(pos + 1) == Some(&b'\n')),
-                Some(b'\n') => 1,
-                _ => 0,
-            }
-        }
-        let mut from = 0;
-        while let Some(pos) = memmem::find(&chunk[from..], DONE_EVENT) {
-            let start = from + pos;
-            let anchored = match start.checked_sub(1) {
-                None => at_line_start,
-                Some(prev) => chunk[prev] == b'\n' || chunk[prev] == b'\r',
-            };
-            if anchored {
-                let line_end = start + DONE_EVENT.len();
-                let eol1 = eol_len_at(chunk, line_end);
-                if eol1 > 0 && eol_len_at(chunk, line_end + eol1) > 0 {
-                    return true;
-                }
-            }
-            from = start + 1;
-        }
-        false
-    }
-
     // Simple helper to merge logprobs in streaming responses
     // Optimized to reduce allocations in the merge path
     fn merge_streaming_logprobs(
         prefill_logprobs: Option<&Value>,
-        decode_chunk: &[u8],
+        decode_json: Option<&mut Value>,
         encoder: &mut SseEncoder,
     ) -> Result<Bytes, ()> {
-        // Skip non-data chunks
-        let chunk_str = std::str::from_utf8(decode_chunk).map_err(|_| ())?;
-        if !chunk_str.starts_with("data: ") {
-            return Err(());
-        }
-
-        // Parse JSON from chunk. The `[DONE]` sentinel must be matched
-        // exactly, not by substring: payloads that merely contain that text
-        // still need their logprobs merged.
-        let json_str = chunk_str.trim_start_matches("data: ").trim();
-        if json_str == "[DONE]" {
-            return Err(());
-        }
-        let mut decode_json: Value = serde_json::from_str(json_str).map_err(|_| ())?;
+        let decode_json = decode_json.ok_or(())?;
 
         // Merge prefill logprobs if available
         if let Some(p_logprobs) = prefill_logprobs {
@@ -1298,7 +1517,7 @@ impl PDRouter {
         }
 
         // Re-serialize via the shared encoder (reuses its buffer across chunks).
-        encoder.encode_data(&decode_json).map_err(|_| ())
+        encoder.encode_data(decode_json).map_err(|_| ())
     }
 }
 
@@ -1312,7 +1531,10 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, UNKNOWN_MODEL_ID, None).await {
+        let (prefill, decode) = match self
+            .select_pd_pair(None, UNKNOWN_MODEL_ID, None, None)
+            .await
+        {
             Ok(pair) => pair,
             Err(e) => {
                 return error::service_unavailable(
@@ -1403,7 +1625,7 @@ impl RouterTrait for PDRouter {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: &GenerateRequest,
         model_id: &str,
     ) -> Response {
@@ -1428,13 +1650,14 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, tenant_meta, body, context)
+            .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: &ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
@@ -1471,13 +1694,14 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, tenant_meta, body, context)
+            .await
     }
 
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: &CompletionRequest,
         model_id: &str,
     ) -> Response {
@@ -1506,13 +1730,14 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, tenant_meta, body, context)
+            .await
     }
 
     async fn route_rerank(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: &RerankRequest,
         model_id: &str,
     ) -> Response {
@@ -1533,7 +1758,8 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, tenant_meta, body, context)
+            .await
     }
 
     fn router_type(&self) -> &'static str {
@@ -1543,6 +1769,8 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::{
         config::PolicyConfig,
@@ -1559,6 +1787,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
+            pd_lifecycle_config: None,
         }
     }
 
@@ -1575,78 +1804,476 @@ mod tests {
         Box::new(worker)
     }
 
+    fn create_labeled_worker(
+        url: &str,
+        worker_type: WorkerType,
+        labels: &[(&str, &str)],
+    ) -> Arc<dyn Worker> {
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .labels(
+                labels
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect::<HashMap<_, _>>(),
+            )
+            .build();
+        worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        Arc::new(worker)
+    }
+
     #[test]
     fn test_done_event_detection() {
         // Production-incident payload: a delta whose arguments contained the
         // literal sentinel text; the old substring scan treated it as
         // terminal and silently killed the stream.
         let incident: &[u8] = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"// data: [DONE]\"}}]}}]}\n\n";
-        // (chunk, chunk begins at a line boundary, expected, case)
-        let cases: &[(&[u8], bool, bool, &str)] = &[
-            (b"data: [DONE]\n\n", true, true, "standalone sentinel"),
+        let cases: &[(&[u8], bool, &str)] = &[
+            (b"data: [DONE]\n\n", true, "standalone sentinel"),
             (
                 b"data: {\"x\":1}\n\ndata: [DONE]\n\n",
                 true,
-                true,
                 "sentinel after a data event",
             ),
-            (b"data: [DONE]\r\n\r\n", true, true, "CRLF endings"),
-            (
-                b"\ndata: [DONE]\n\n",
-                false,
-                true,
-                "line boundary inside the chunk",
-            ),
-            (incident, true, false, "sentinel text inside a JSON payload"),
+            (b"data: [DONE]\r\n\r\n", true, "CRLF endings"),
+            (incident, false, "sentinel text inside a JSON payload"),
             (
                 b"data: [DONE]{\"x\":1}\n\n",
-                true,
                 false,
                 "line continues with payload",
             ),
-            (b"data: [DONE]\n\n", false, false, "chunk starts mid-line"),
             (
                 b"data: [DONE]",
-                true,
                 false,
                 "possibly a split payload line: defer",
             ),
             (
                 b"data: [DONE]\n",
-                true,
                 false,
                 "event delimiter incomplete: defer",
             ),
             (
                 b"data: [DONE]\ndata: x\n\n",
-                true,
                 false,
                 "one event, joined data is not [DONE]",
             ),
         ];
-        for (chunk, at_line_start, expected, case) in cases {
+        for (chunk, expected, case) in cases {
+            let mut parser = PdSseParser::default();
             assert_eq!(
-                PDRouter::chunk_contains_done_event(chunk, *at_line_start),
+                parser.observe_chunk(chunk, |_| {}).done,
                 *expected,
                 "{case}"
             );
+        }
+
+        let mut split = PdSseParser::default();
+        assert!(!split.observe_chunk(b"data: [DO", |_| {}).done);
+        assert!(split.observe_chunk(b"NE]\n\n", |_| {}).done);
+
+        let mut multiline = PdSseParser::default();
+        assert!(
+            !multiline
+                .observe_chunk(b"data: [DONE]\ndata: x\n\n", |_| {})
+                .done
+        );
+    }
+
+    #[test]
+    fn lifecycle_success_waits_for_downstream_terminal_marker() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        use crate::observability::pd_request_lifecycle::TrafficClass;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let config = Arc::new(
+                PdLifecycleConfig::new(
+                    "test",
+                    "glm52",
+                    "stable",
+                    "smg-pd-request-v1",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "0744ea180744ea180744ea180744ea180744ea18",
+                )
+                .expect("valid lifecycle config"),
+            );
+            let request = PdRequestLifecycle::start(config, TrafficClass::Natural);
+            let (tx, rx) = mpsc::channel(4);
+            tx.try_send(PdRelayEvent::Data {
+                result: Ok(Bytes::from_static(
+                    b"data: {\"text\":\"a\",\"meta_info\":{\"prompt_tokens\":8,\"completion_tokens\":1}}\n\n",
+                )),
+                observed_events: vec![serde_json::json!({
+                    "text": "a",
+                    "meta_info": {"prompt_tokens": 8, "completion_tokens": 1}
+                })],
+                observation_overflowed: false,
+            })
+            .expect("receiver is open");
+            tx.try_send(PdRelayEvent::Terminal(PdTerminalOutcome::Success))
+                .expect("receiver is open");
+            drop(tx);
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let mut stream = PdLifecycleRelayStream::new(rx, Some(request), StatusCode::OK);
+                assert!(stream.next().await.is_some());
+                assert!(
+                    !handle.render().contains("smg_pd_terminal_requests_total{"),
+                    "upstream relay completion must not finish the request before downstream polls the terminal marker"
+                );
+                assert!(stream.next().await.is_none());
+            });
+        });
+
+        assert_eq!(
+            handle
+                .render()
+                .matches("smg_pd_terminal_requests_total{")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn sse_application_error_followed_by_done_is_terminal_error() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        use crate::observability::pd_request_lifecycle::TrafficClass;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let router = create_test_pd_router();
+                let config = Arc::new(
+                    PdLifecycleConfig::new(
+                        "test",
+                        "glm52",
+                        "stable",
+                        "smg-pd-request-v1",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "0744ea180744ea180744ea180744ea180744ea18",
+                    )
+                    .expect("valid lifecycle config"),
+                );
+                let request = PdRequestLifecycle::start(config, TrafficClass::Natural);
+                let upstream = tokio_stream::iter(vec![
+                    Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                        b"data: {\"error\":{\"message\":\"partial failure\"}}\n\n",
+                    )),
+                    Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
+                ]);
+                let response = router.create_streaming_response(
+                    upstream,
+                    StatusCode::OK,
+                    None,
+                    false,
+                    None,
+                    None,
+                    Vec::new(),
+                    Some(request),
+                );
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("relay body");
+            });
+        });
+
+        let rendered = handle.render();
+        assert_eq!(
+            rendered.matches("smg_pd_terminal_requests_total{").count(),
+            1
+        );
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("smg_pd_terminal_requests_total{")
+                && line.contains(r#"outcome="error""#)
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("smg_pd_request_metric_evidence_total{")
+                && line.contains(r#"metric="usage""#)
+                && line.contains(r#"evidence_state="unknown""#)
+        }));
+    }
+
+    #[test]
+    fn oversized_sse_event_batch_is_forwarded_but_metrics_fail_closed() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        use crate::observability::pd_request_lifecycle::TrafficClass;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut payload = String::new();
+        for event_index in 0..129 {
+            let event = if event_index == 128 {
+                serde_json::json!({
+                    "text": "x",
+                    "meta_info": {"prompt_tokens": 8, "completion_tokens": 129}
+                })
+            } else {
+                serde_json::json!({"text": "x"})
+            };
+            payload.push_str(&format!("data: {event}\n\n"));
+        }
+        payload.push_str("data: [DONE]\n\n");
+
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let router = create_test_pd_router();
+                let config = Arc::new(
+                    PdLifecycleConfig::new(
+                        "test",
+                        "glm52",
+                        "stable",
+                        "smg-pd-request-v1",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "0744ea180744ea180744ea180744ea180744ea18",
+                    )
+                    .expect("valid lifecycle config"),
+                );
+                let request = PdRequestLifecycle::start(config, TrafficClass::Natural);
+                let upstream = tokio_stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+                    payload.clone(),
+                ))]);
+                let response = router.create_streaming_response(
+                    upstream,
+                    StatusCode::OK,
+                    None,
+                    false,
+                    None,
+                    None,
+                    Vec::new(),
+                    Some(request),
+                );
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("relay body");
+                assert_eq!(body.as_ref(), payload.as_bytes());
+            });
+        });
+
+        let rendered = handle.render();
+        for metric in ["usage", "ttft", "tpot"] {
+            assert!(rendered.lines().any(|line| {
+                line.starts_with("smg_pd_request_metric_evidence_total{")
+                    && line.contains(&format!(r#"metric="{metric}""#))
+                    && line.contains(r#"evidence_state="unknown""#)
+            }));
+        }
+        assert!(!rendered.contains("smg_pd_tpot_seconds_count{"));
+    }
+
+    #[test]
+    fn oversized_single_sse_event_is_forwarded_but_metrics_fail_closed() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        use crate::observability::pd_request_lifecycle::TrafficClass;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let oversized_token = "x".repeat(64 * 1024 + 1);
+        let payload = format!(
+            concat!(
+                "data: {{\"text\":\"a\",\"meta_info\":{{\"completion_tokens\":1}}}}\n\n",
+                "data: {{\"text\":\"b\",\"meta_info\":{{\"completion_tokens\":2}}}}\n\n",
+                "data: {{\"text\":\"{}\",\"meta_info\":{{\"completion_tokens\":3}}}}\n\n",
+                "data: {{\"meta_info\":{{\"prompt_tokens\":8,\"completion_tokens\":3}}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            oversized_token
+        );
+
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let router = create_test_pd_router();
+                let config = Arc::new(
+                    PdLifecycleConfig::new(
+                        "test",
+                        "glm52",
+                        "stable",
+                        "smg-pd-request-v1",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "0744ea180744ea180744ea180744ea180744ea18",
+                    )
+                    .expect("valid lifecycle config"),
+                );
+                let request = PdRequestLifecycle::start(config, TrafficClass::Natural);
+                let upstream = tokio_stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+                    payload.clone(),
+                ))]);
+                let response = router.create_streaming_response(
+                    upstream,
+                    StatusCode::OK,
+                    None,
+                    false,
+                    None,
+                    None,
+                    Vec::new(),
+                    Some(request),
+                );
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("relay body");
+                assert_eq!(body.as_ref(), payload.as_bytes());
+            });
+        });
+
+        let rendered = handle.render();
+        for metric in ["usage", "ttft", "tpot"] {
+            assert!(rendered.lines().any(|line| {
+                line.starts_with("smg_pd_request_metric_evidence_total{")
+                    && line.contains(&format!(r#"metric="{metric}""#))
+                    && line.contains(r#"evidence_state="unknown""#)
+            }));
+        }
+        assert!(!rendered.contains("smg_pd_completed_input_tokens_total{"));
+        assert!(!rendered.contains("smg_pd_completed_output_tokens_total{"));
+        assert!(!rendered.contains("smg_pd_request_v1_ttft_seconds_count{"));
+        assert!(!rendered.contains("smg_pd_tpot_seconds_count{"));
+    }
+
+    #[test]
+    fn oversized_sse_event_skips_logprob_merge_and_preserves_bytes() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        use crate::observability::pd_request_lifecycle::TrafficClass;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let oversized_token = "x".repeat(64 * 1024 + 1);
+        let first_chunk = format!(
+            concat!(
+                "data: {{\"text\":\"a\",\"meta_info\":{{",
+                "\"input_token_logprobs\":[[-0.2,1,\"a\"]],",
+                "\"completion_tokens\":1}}}}\n\n",
+                "data: {{\"text\":\"{}\",\"meta_info\":",
+                "{{\"completion_tokens\":2}}}}\n\n"
+            ),
+            oversized_token
+        );
+        let final_chunk = concat!(
+            "data: {\"meta_info\":{\"prompt_tokens\":8,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let expected = format!("{first_chunk}{final_chunk}");
+
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let router = create_test_pd_router();
+                let config = Arc::new(
+                    PdLifecycleConfig::new(
+                        "test",
+                        "glm52",
+                        "stable",
+                        "smg-pd-request-v1",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "0744ea180744ea180744ea180744ea180744ea18",
+                    )
+                    .expect("valid lifecycle config"),
+                );
+                let request = PdRequestLifecycle::start(config, TrafficClass::Natural);
+                let upstream = tokio_stream::iter(vec![
+                    Ok::<Bytes, reqwest::Error>(Bytes::from(first_chunk)),
+                    Ok::<Bytes, reqwest::Error>(Bytes::from_static(final_chunk.as_bytes())),
+                ]);
+                let response = router.create_streaming_response(
+                    upstream,
+                    StatusCode::OK,
+                    Some(serde_json::json!([[-0.1, 0, "prefill"]])),
+                    true,
+                    None,
+                    None,
+                    Vec::new(),
+                    Some(request),
+                );
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("relay body");
+                assert_eq!(body.as_ref(), expected.as_bytes());
+            });
+        });
+
+        let rendered = handle.render();
+        for metric in ["usage", "ttft", "tpot"] {
+            assert!(rendered.lines().any(|line| {
+                line.starts_with("smg_pd_request_metric_evidence_total{")
+                    && line.contains(&format!(r#"metric="{metric}""#))
+                    && line.contains(r#"evidence_state="unknown""#)
+            }));
         }
     }
 
     #[test]
     fn test_merge_streaming_logprobs_sentinel_exact_match() {
         let mut encoder = SseEncoder::new();
-        // The exact sentinel is skipped (caller forwards it verbatim)
-        assert!(
-            PDRouter::merge_streaming_logprobs(None, b"data: [DONE]\n\n", &mut encoder).is_err()
-        );
+        // The exact sentinel produces no parsed JSON event and is forwarded.
+        assert!(PDRouter::merge_streaming_logprobs(None, None, &mut encoder).is_err());
         // A payload containing "[DONE]" as text is still processed
-        assert!(PDRouter::merge_streaming_logprobs(
-            None,
-            b"data: {\"text\":\"[DONE]\",\"meta_info\":{}}\n\n",
-            &mut encoder
-        )
-        .is_ok());
+        let mut event = serde_json::json!({"text": "[DONE]", "meta_info": {}});
+        assert!(PDRouter::merge_streaming_logprobs(None, Some(&mut event), &mut encoder).is_ok());
+    }
+
+    #[test]
+    fn pd_response_boundary_strips_internal_probe_headers() {
+        let mut response = Response::new(Body::empty());
+        for name in [
+            "x-smg-pd-service",
+            "x-smg-pd-release",
+            "x-smg-pd-environment",
+            "x-smg-pd-release-generation",
+            "x-smg-pd-membership-checksum",
+            "x-smg-pd-cache-domain",
+            "x-smg-pd-traffic-class",
+        ] {
+            response
+                .headers_mut()
+                .insert(name, HeaderValue::from_static("forged"));
+        }
+        response
+            .headers_mut()
+            .insert("x-request-id", HeaderValue::from_static("kept"));
+
+        PDRouter::finalize_pd_response(&mut response, None);
+
+        for name in [
+            "x-smg-pd-service",
+            "x-smg-pd-release",
+            "x-smg-pd-environment",
+            "x-smg-pd-release-generation",
+            "x-smg-pd-membership-checksum",
+            "x-smg-pd-cache-domain",
+            "x-smg-pd-traffic-class",
+        ] {
+            assert!(!response.headers().contains_key(name), "leaked {name}");
+        }
+        assert_eq!(response.headers()["x-request-id"], "kept");
     }
 
     #[test]
@@ -1698,7 +2325,9 @@ mod tests {
             .worker_registry
             .register_or_replace(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, UNKNOWN_MODEL_ID, None).await;
+        let result = router
+            .select_pd_pair(None, UNKNOWN_MODEL_ID, None, None)
+            .await;
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -1708,10 +2337,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trusted_probe_cache_domain_filters_both_pd_legs() {
+        let router = create_test_pd_router();
+        for worker in [
+            create_labeled_worker(
+                "http://prefill-a",
+                WorkerType::Prefill,
+                &[
+                    ("cache_domain", "cache-a"),
+                    ("execution_cohort_pair_id", "pair-a"),
+                ],
+            ),
+            create_labeled_worker(
+                "http://decode-a",
+                WorkerType::Decode,
+                &[("execution_cohort_pair_id", "pair-a")],
+            ),
+            create_labeled_worker(
+                "http://prefill-b",
+                WorkerType::Prefill,
+                &[
+                    ("cache_domain", "cache-b"),
+                    ("execution_cohort_pair_id", "pair-b"),
+                ],
+            ),
+            create_labeled_worker(
+                "http://decode-b",
+                WorkerType::Decode,
+                &[("execution_cohort_pair_id", "pair-b")],
+            ),
+        ] {
+            router.worker_registry.register_or_replace(worker);
+        }
+
+        let (prefill, decode) = router
+            .select_pd_pair(None, UNKNOWN_MODEL_ID, None, Some("cache-b"))
+            .await
+            .expect("catalogued cache-domain pair");
+        assert_eq!(prefill.url(), "http://prefill-b");
+        assert_eq!(decode.url(), "http://decode-b");
+    }
+
+    #[tokio::test]
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, UNKNOWN_MODEL_ID, None).await;
+        let result = router
+            .select_pd_pair(None, UNKNOWN_MODEL_ID, None, None)
+            .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
@@ -1804,6 +2477,7 @@ mod tests {
     async fn test_streaming_load_tracking() {
         use futures_util::StreamExt;
         use tokio::time::{sleep, Duration};
+        use tokio_stream::wrappers::UnboundedReceiverStream;
 
         let router = create_test_pd_router();
 
@@ -1848,6 +2522,7 @@ mod tests {
                 None,
                 None,
                 guards,
+                None,
             );
 
             // Guards are now attached to response body, so load should be 1

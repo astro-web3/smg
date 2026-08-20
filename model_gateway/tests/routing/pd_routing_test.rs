@@ -152,14 +152,52 @@ mod pd_routing_tests {
     }
 
     /// A non-streaming PD request must emit the SMG-only PD metrics, including
-    /// the honest `smg_pd_ttft_seconds`. Runs on a current-thread runtime so the
+    /// the pre-existing transport-level `smg_pd_ttft_seconds`. Runs on a current-thread runtime so the
     /// thread-local Prometheus recorder captures emissions from the request path.
     #[test]
+    #[serial_test::serial]
     fn test_pd_metrics_emitted_on_request() {
         use metrics_exporter_prometheus::PrometheusBuilder;
 
+        const PD_METRICS_ENV: [(&str, &str); 7] = [
+            ("SMG_PD_ENVIRONMENT", "test"),
+            ("SMG_PD_SERVICE", "glm52"),
+            ("SMG_PD_RELEASE", "stable"),
+            ("SMG_PD_METRIC_CONTRACT_VERSION", "smg-pd-request-v1"),
+            (
+                "SMG_PD_SCHEMA_DIGEST",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                "SMG_PD_IMAGE_DIGEST",
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+            (
+                "SMG_PD_PRODUCER_REVISION",
+                "0744ea180744ea180744ea180744ea180744ea18",
+            ),
+        ];
+
+        struct PdMetricsEnvGuard;
+        impl PdMetricsEnvGuard {
+            fn install() -> Self {
+                for (key, value) in PD_METRICS_ENV {
+                    std::env::set_var(key, value);
+                }
+                Self
+            }
+        }
+        impl Drop for PdMetricsEnvGuard {
+            fn drop(&mut self) {
+                for (key, _) in PD_METRICS_ENV {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
+        let _env = PdMetricsEnvGuard::install();
 
         metrics::with_local_recorder(&recorder, || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -199,6 +237,7 @@ mod pd_routing_tests {
                     .method("POST")
                     .uri("/generate")
                     .header(CONTENT_TYPE, "application/json")
+                    .header("x-smg-traffic-class", "synthetic")
                     .body(Body::from(serde_json::to_string(&payload).unwrap()))
                     .unwrap();
 
@@ -217,6 +256,39 @@ mod pd_routing_tests {
         assert!(
             rendered.contains("smg_pd_ttft_seconds_count"),
             "smg_pd_ttft_seconds not emitted; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("smg_pd_request_lifecycle_contract_info{")
+                && rendered.contains(r#"metric_contract_version="smg-pd-request-v1""#),
+            "PD lifecycle capability anchor not emitted; rendered:\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("smg_pd_requests_started_total{").count(),
+            1,
+            "request start must be emitted once; rendered:\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("smg_pd_terminal_requests_total{").count(),
+            1,
+            "request terminal must be emitted once; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"traffic_class="natural""#)
+                && !rendered.contains(r#"traffic_class="synthetic""#),
+            "public client traffic class must fail safe to natural; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("smg_pd_completed_input_tokens_total{")
+                && rendered.contains("smg_pd_completed_output_tokens_total{"),
+            "validated terminal usage counters not emitted; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"execution_cohort_pair_id="unassigned""#),
+            "workers without trusted cohort metadata must fail closed; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"workload_bucket="unassigned""#),
+            "public traffic without a trusted request classifier must not inherit an operator-wide workload bucket; rendered:\n{rendered}"
         );
     }
 

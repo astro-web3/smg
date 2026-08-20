@@ -7,4 +7,5 @@ pub mod logging;
 pub mod metrics;
 pub mod metrics_server;
 pub mod otel_trace;
+pub(crate) mod pd_request_lifecycle;
 pub mod runtime_metrics;
