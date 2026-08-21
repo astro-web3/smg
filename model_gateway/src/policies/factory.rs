@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use super::{
-    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
-    LeastLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy, PassthroughPolicy,
-    PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwareLengthConfig, CacheAwareLengthPolicy,
+    CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, ManualConfig,
+    ManualPolicy, PassthroughPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy,
+    RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -72,6 +73,30 @@ impl PolicyFactory {
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
+            PolicyConfig::CacheAwareLength {
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
+                chars_per_token,
+                long_prefill_threshold,
+                long_pool_max_load,
+                short_pool_max_load,
+            } => {
+                let config = CacheAwareLengthConfig {
+                    cache_threshold: *cache_threshold,
+                    balance_abs_threshold: *balance_abs_threshold,
+                    balance_rel_threshold: *balance_rel_threshold,
+                    eviction_interval_secs: *eviction_interval_secs,
+                    max_tree_size: *max_tree_size,
+                    chars_per_token: *chars_per_token,
+                    long_prefill_threshold: *long_prefill_threshold,
+                    long_pool_max_load: *long_pool_max_load,
+                    short_pool_max_load: *short_pool_max_load,
+                };
+                Arc::new(CacheAwareLengthPolicy::with_config(config))
+            }
             PolicyConfig::Bucket {
                 balance_abs_threshold,
                 balance_rel_threshold,
@@ -123,6 +148,9 @@ impl PolicyFactory {
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "least_load" | "leastload" => Some(Arc::new(LeastLoadPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
+            "cache_aware_length" | "cacheawarelength" => {
+                Some(Arc::new(CacheAwareLengthPolicy::new()))
+            }
             "bucket" => Some(Arc::new(BucketPolicy::new())),
             "manual" => Some(Arc::new(ManualPolicy::new())),
             "consistent_hashing" | "consistenthashing" => {
@@ -171,6 +199,19 @@ mod tests {
         });
         assert_eq!(policy.name(), "cache_aware");
 
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::CacheAwareLength {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 30,
+            max_tree_size: 10000,
+            chars_per_token: 4,
+            long_prefill_threshold: 100_000,
+            long_pool_max_load: 256,
+            short_pool_max_load: 256,
+        });
+        assert_eq!(policy.name(), "cache_aware_length");
+
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Bucket {
             balance_abs_threshold: 10,
             balance_rel_threshold: 1.5,
@@ -212,6 +253,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
+        assert!(PolicyFactory::create_by_name("cache_aware_length").is_some());
+        assert!(PolicyFactory::create_by_name("CacheAwareLength").is_some());
         assert!(PolicyFactory::create_by_name("bucket").is_some());
         assert!(PolicyFactory::create_by_name("Bucket").is_some());
         assert!(PolicyFactory::create_by_name("manual").is_some());
