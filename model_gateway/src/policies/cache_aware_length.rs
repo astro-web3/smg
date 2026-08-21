@@ -842,4 +842,98 @@ mod tests {
             Some("long")
         );
     }
+
+    // --- 补充场景 ---
+
+    /// Step 3: 命中但命中的 worker 不健康 → 清理 stale + 回退第一个健康 worker
+    #[test]
+    fn step3_hit_unhealthy_falls_back_to_first_healthy() {
+        let policy = CacheAwareLengthPolicy::with_config(test_config());
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            make_worker("http://w1:8000", None, 0),         // short pool
+            make_worker("http://w2:8000", Some("long"), 0), // long pool
+        ];
+        policy.init_workers(&workers);
+
+        // 第一次请求：用长 prompt 建立缓存，记录到某个 worker
+        let prompt = "shared cache-building prompt for affinity";
+        let first = policy
+            .select_worker(&workers, &info_with_text(prompt))
+            .unwrap();
+
+        // 把被选中的 worker 标记为不健康
+        workers[first].set_status(WorkerStatus::NotReady);
+
+        // 第二次相同 prompt：match_rate > threshold（命中），但命中 worker 不健康
+        // → 清理 stale + 回退第一个健康 worker
+        let second = policy
+            .select_worker(&workers, &info_with_text(prompt))
+            .unwrap();
+
+        // 选中的不能是不健康的那个
+        assert_ne!(
+            workers[second].url(),
+            workers[first].url(),
+            "unhealthy matched worker must not be selected"
+        );
+        // 选中的必须是仍然健康的 worker
+        assert!(
+            workers[second].is_available(),
+            "should fall back to a healthy worker"
+        );
+    }
+
+    /// Step 4 ≥100K: 长池全不健康 + 短池有 load=0 worker → 长→短溢出到 idle worker
+    #[test]
+    fn step4_long_pool_unhealthy_overflows_to_idle_short() {
+        let policy = CacheAwareLengthPolicy::with_config(test_config());
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            make_worker("http://w1:8000", None, 0), // short, idle (load 0)
+            make_worker("http://w2:8000", Some("long"), 0), // long, healthy but will be marked unhealthy
+        ];
+        policy.init_workers(&workers);
+
+        // 标记长池 worker 不健康
+        workers[1].set_status(WorkerStatus::NotReady);
+
+        let headers = tokens_headers(200_000);
+        let info = info_with_header(&headers, "novel prompt no match yet");
+        let idx = policy.select_worker(&workers, &info).unwrap();
+        assert_eq!(
+            workers[idx].url(),
+            "http://w1:8000",
+            "long pool all unhealthy → overflow to idle short worker"
+        );
+    }
+
+    /// Step 4 token 源优先级：header 精确值覆盖字符级估算
+    #[test]
+    fn step4_header_overrides_char_estimate() {
+        // 用一个短 prompt（字符估算会算出 <100K → 短请求 → 短池），
+        // 但 header 传 200000（≥100K → 长请求 → 长池）。
+        // 如果 header 优先级正确，应该走路请求分支选长池。
+        let policy = CacheAwareLengthPolicy::with_config(test_config());
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            make_worker("http://w1:8000", None, 0),         // short pool
+            make_worker("http://w2:8000", Some("long"), 0), // long pool
+        ];
+        policy.init_workers(&workers);
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            HEADER_PROMPT_TOKENS,
+            http::HeaderValue::from_static("200000"),
+        );
+        let info = SelectWorkerInfo {
+            request_text: Some("short"), // 字符估算会算出 1 token → 短请求
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let idx = policy.select_worker(&workers, &info).unwrap();
+        assert_eq!(
+            workers[idx].url(),
+            "http://w2:8000",
+            "header (200K) must override char estimate (1 token) → long pool"
+        );
+    }
 }
