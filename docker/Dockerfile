@@ -149,12 +149,13 @@ RUN apt update -y \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version && protoc --version
 
-# Dependency pre-build layer: copy only manifests (Cargo.toml/Cargo.lock) and
-# create dummy lib.rs/main.rs for every crate so `cargo build` compiles all
+# Dependency pre-build layer: copy only manifests (Cargo.toml) and create
+# dummy lib.rs/main.rs for every crate so `cargo build` compiles all
 # dependencies into the BuildKit layer cache. When source changes but
-# Cargo.toml/Cargo.lock don't, this layer is a cache hit — skipping the ~10min
+# Cargo.toml don't, this layer is a cache hit — skipping the ~10min
 # dependency download+compile, leaving only the fast business-code rebuild.
-COPY --from=local_src /src/Cargo.toml /src/Cargo.lock /opt/smg/
+# Cargo.lock is git-ignored; generate it in-container for reproducible deps.
+COPY --from=local_src /src/Cargo.toml /opt/smg/
 COPY --from=local_src /src/model_gateway/Cargo.toml /opt/smg/model_gateway/Cargo.toml
 COPY --from=local_src /src/crates/ /opt/smg/crates/
 COPY --from=local_src /src/bindings/python/Cargo.toml /opt/smg/bindings/python/Cargo.toml
@@ -167,6 +168,7 @@ RUN cd /opt/smg \
          [ -f "$d/src/lib.rs" ] || echo '' > "$d/src/lib.rs"; \
          [ -f "$d/src/main.rs" ] || echo 'fn main() {}' > "$d/src/main.rs"; \
        done \
+    && cargo generate-lockfile \
     && uv pip install maturin \
     && cd bindings/python \
     && ulimit -n 65536 && timeout 1200 maturin build --release --features vendored-openssl,opencv-video --out dist || true
