@@ -170,3 +170,37 @@ jobs:
           done
 
           echo "镜像推送成功"
+
+      - name: Publish image info to summary
+        if: always()
+        env:
+          GHCR_TAG: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-smg:${{ steps.meta.outputs.version }}
+          ALIYUN_TAG: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/1xtoken-smg:${{ steps.meta.outputs.version }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          {
+            echo "## Docker Image Build"
+            echo ""
+            if [ "$BUILD_OUTCOME" = "success" ]; then
+              echo "✅ Build and push succeeded"
+              echo ""
+              echo "| Registry | Image |"
+              echo "| --- | --- |"
+              echo "| GHCR | \`${GHCR_TAG}\` |"
+              echo "| Aliyun | \`${ALIYUN_TAG}\` |"
+              echo ""
+              echo "### Pull command"
+              echo ""
+              echo '```bash'
+              echo "# From GHCR (fast, international)"
+              echo "docker pull ${GHCR_TAG}"
+              echo ""
+              echo "# From Aliyun (fast, domestic China)"
+              echo "docker pull ${ALIYUN_TAG}"
+              echo '```'
+            else
+              echo "❌ Build failed"
+              echo ""
+              echo "Check the logs above for details."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
