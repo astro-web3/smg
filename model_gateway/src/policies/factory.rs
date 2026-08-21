@@ -292,8 +292,18 @@ mod tests {
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
-        assert!(PolicyFactory::create_by_name("cache_aware_length").is_some());
-        assert!(PolicyFactory::create_by_name("CacheAwareLength").is_some());
+        assert_eq!(
+            PolicyFactory::create_by_name("cache_aware_length")
+                .unwrap()
+                .name(),
+            "cache_aware_length"
+        );
+        assert_eq!(
+            PolicyFactory::create_by_name("CacheAwareLength")
+                .unwrap()
+                .name(),
+            "cache_aware_length"
+        );
         assert!(PolicyFactory::create_by_name("bucket").is_some());
         assert!(PolicyFactory::create_by_name("Bucket").is_some());
         assert!(PolicyFactory::create_by_name("manual").is_some());

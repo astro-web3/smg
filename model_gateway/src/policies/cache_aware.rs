@@ -85,6 +85,18 @@ use crate::{
 /// Latest per-worker backend load snapshot stream, keyed by worker URL.
 pub(crate) type LoadReceiver = watch::Receiver<HashMap<String, WorkerLoadResponse>>;
 
+/// Hint about the uncached prefill portion from a partial cache match that
+/// fell below `cache_threshold`. Lets the no-cache strategy classify by
+/// actual prefill work instead of the full request size.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum UncachedHint {
+    /// Uncached token count (gRPC / token-tree path).
+    Tokens(usize),
+    /// Uncached character count (HTTP / string-tree path); the strategy
+    /// converts to tokens via its `chars_per_token` setting.
+    Chars(usize),
+}
+
 /// Strategy for the no-cache branch: when a request does not hit the
 /// cache tree (or KV events / hash index), this trait selects which worker
 /// receives the request. The default behavior (no strategy set) routes to
@@ -95,6 +107,12 @@ pub(crate) trait NoCacheStrategy: Send + Sync + std::fmt::Debug {
     /// Select a worker for the no-cache (miss) branch. `min_load_idx` is
     /// the pre-computed least-loaded healthy worker the caller would use
     /// by default; the strategy may return it or a pool-selected alternative.
+    ///
+    /// `uncached_hint` carries the estimated uncached-prefill size when the
+    /// call originates from a partial cache match that fell below
+    /// `cache_threshold`. It is `None` when no matching was attempted (e.g.
+    /// imbalanced fallback, event-driven no-overlap, hash-path fallback), in
+    /// which case the strategy should estimate from `info` as before.
     fn select_no_cache(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -103,6 +121,7 @@ pub(crate) trait NoCacheStrategy: Send + Sync + std::fmt::Debug {
         min_load_idx: Option<usize>,
         avg_load: f64,
         model_id: &str,
+        uncached_hint: Option<UncachedHint>,
     ) -> Option<usize>;
 }
 
@@ -369,6 +388,10 @@ impl CacheAwarePolicy {
     /// it; otherwise fall back to `min_load_idx` (the default behavior).
     /// Callers still own tree update + `increment_processed` for the
     /// returned index.
+    ///
+    /// `uncached_hint` is the estimated uncached-prefill token count from a
+    /// partial cache match (below `cache_threshold`); `None` when no matching
+    /// was attempted.
     fn resolve_no_cache(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -377,6 +400,7 @@ impl CacheAwarePolicy {
         min_load_idx: Option<usize>,
         avg_load: f64,
         model_id: &str,
+        uncached_hint: Option<UncachedHint>,
     ) -> Option<usize> {
         match &self.no_cache_strategy {
             Some(strategy) => strategy.select_no_cache(
@@ -386,6 +410,7 @@ impl CacheAwarePolicy {
                 min_load_idx,
                 avg_load,
                 model_id,
+                uncached_hint,
             ),
             None => min_load_idx,
         }
@@ -764,6 +789,7 @@ impl CacheAwarePolicy {
             min_load_idx,
             avg_load,
             model_id,
+            None,
         )?;
 
         let worker_url = workers[min_load_idx].url().to_string();
@@ -1369,6 +1395,7 @@ impl CacheAwarePolicy {
             min_load_idx,
             avg_load,
             model_id,
+            None,
         )?;
         debug!(
             worker = workers[min_idx].url(),
@@ -1734,6 +1761,7 @@ impl CacheAwarePolicy {
             min_load_idx,
             avg_load,
             model_id,
+            None,
         )?;
         if !applicable.is_empty() {
             self.record_placement(model_id, tokens, applicable, workers[idx].url(), now);
@@ -1909,6 +1937,19 @@ impl CacheAwarePolicy {
                         min_load_idx,
                     )
                 } else {
+                    // Partial match below threshold: pass the uncached
+                    // portion (input - matched) so the length strategy can
+                    // classify by actual prefill work, not full size.
+                    // When matched == 0 (no match at all), pass None so the
+                    // strategy falls through to its normal priority chain
+                    // (header → tokens → char estimate).
+                    let uncached_hint = (result.matched_token_count > 0).then(|| {
+                        UncachedHint::Tokens(
+                            result
+                                .input_token_count
+                                .saturating_sub(result.matched_token_count),
+                        )
+                    });
                     self.resolve_no_cache(
                         workers,
                         info,
@@ -1916,6 +1957,7 @@ impl CacheAwarePolicy {
                         min_load_idx,
                         avg_load,
                         model_id,
+                        uncached_hint,
                     )
                 };
 
@@ -2034,6 +2076,18 @@ impl CacheAwarePolicy {
                         min_load_idx,
                     )
                 } else {
+                    // Partial match below threshold: pass the uncached
+                    // char count (input - matched) so the length strategy
+                    // can classify by actual prefill work, not full size.
+                    // When matched == 0 (no match at all), pass None so the
+                    // strategy falls through to its normal priority chain.
+                    let uncached_hint = (result.matched_char_count > 0).then(|| {
+                        UncachedHint::Chars(
+                            result
+                                .input_char_count
+                                .saturating_sub(result.matched_char_count),
+                        )
+                    });
                     self.resolve_no_cache(
                         workers,
                         info,
@@ -2041,6 +2095,7 @@ impl CacheAwarePolicy {
                         min_load_idx,
                         avg_load,
                         model_id,
+                        uncached_hint,
                     )
                 };
 

@@ -49,7 +49,7 @@ use tracing::debug;
 
 use super::{
     normalize_model_key, CacheAwareConfig, CacheAwareLengthConfig, CacheAwarePolicy,
-    LoadBalancingPolicy, NoCacheStrategy, SelectWorkerInfo,
+    LoadBalancingPolicy, NoCacheStrategy, SelectWorkerInfo, UncachedHint,
 };
 use crate::{
     mesh::adapters::tree_sync::TreeSyncAdapter,
@@ -183,39 +183,53 @@ impl NoCacheStrategy for LengthStrategy {
         min_load_idx: Option<usize>,
         _avg_load: f64,
         _model_id: &str,
+        uncached_hint: Option<UncachedHint>,
     ) -> Option<usize> {
         if healthy_indices.is_empty() {
             return min_load_idx;
         }
 
         // Compute uncached prefill tokens by priority:
+        // 0. Partial-cache hint (input - matched) when a tree match fell below
+        //    cache_threshold — classify by actual prefill work, not full size.
         // 1. X-Prompt-Tokens header (exact).
         // 2. info.tokens length (token-only gRPC).
-        // 3. (input_chars - matched_chars) / chars_per_token (char estimate).
+        // 3. input_chars / chars_per_token (char estimate).
         // 4. None → all-healthy min-load.
-        let uncached_tokens = self.compute_uncached_tokens(info, workers, healthy_indices);
+        let uncached_tokens =
+            self.compute_uncached_tokens(info, uncached_hint);
 
         let Some(uncached) = uncached_tokens else {
             // Neither source computable → all-healthy min-load.
             return min_load_idx;
         };
 
-        // Split healthy workers into long/short pools by label.
-        let long_indices: Vec<usize> = healthy_indices
+        // Split healthy workers into long/short pools by label, capturing
+        // (load, processed) in the same pass so pool helpers don't re-read
+        // routing_state() per call.
+        let long_pool: Vec<(usize, usize, usize)> = healthy_indices
             .iter()
             .copied()
             .filter(|&i| is_long_pool(&*workers[i]))
+            .map(|i| {
+                let s = workers[i].routing_state();
+                (i, s.load, s.processed)
+            })
             .collect();
-        let short_indices: Vec<usize> = healthy_indices
+        let short_pool: Vec<(usize, usize, usize)> = healthy_indices
             .iter()
             .copied()
             .filter(|&i| !is_long_pool(&*workers[i]))
+            .map(|i| {
+                let s = workers[i].routing_state();
+                (i, s.load, s.processed)
+            })
             .collect();
 
         let selected = if uncached >= self.long_prefill_threshold {
-            self.select_long_request(workers, &long_indices, &short_indices, min_load_idx)
+            self.select_long_request(&long_pool, &short_pool, min_load_idx)
         } else {
-            self.select_short_request(workers, &long_indices, &short_indices, min_load_idx)
+            self.select_short_request(&long_pool, &short_pool, min_load_idx)
         };
 
         // The inner policy's caller (select_worker_min_load, the tree
@@ -230,9 +244,21 @@ impl LengthStrategy {
     fn compute_uncached_tokens(
         &self,
         info: &SelectWorkerInfo,
-        _workers: &[Arc<dyn Worker>],
-        _healthy_indices: &[usize],
+        hint: Option<UncachedHint>,
     ) -> Option<usize> {
+        // 0. Partial-cache hint from a tree match below cache_threshold.
+        if let Some(h) = hint {
+            return match h {
+                UncachedHint::Tokens(n) => Some(n),
+                UncachedHint::Chars(n) => {
+                    if self.chars_per_token > 0 {
+                        Some(n.div_ceil(self.chars_per_token))
+                    } else {
+                        Some(n)
+                    }
+                }
+            };
+        }
         // 1. Exact header value.
         if let Some(n) = parse_prompt_tokens_header(info.headers) {
             return Some(n);
@@ -256,21 +282,19 @@ impl LengthStrategy {
     /// Long request (uncached >= long_prefill_threshold).
     fn select_long_request(
         &self,
-        workers: &[Arc<dyn Worker>],
-        long_indices: &[usize],
-        short_indices: &[usize],
+        long_pool: &[(usize, usize, usize)],
+        short_pool: &[(usize, usize, usize)],
         min_load_idx: Option<usize>,
     ) -> Option<usize> {
-        let long_has_free = pool_has_free(workers, long_indices, self.long_pool_max_load);
-        if long_has_free {
-            return pool_min_load_worker(workers, long_indices);
+        if pool_has_free(long_pool, self.long_pool_max_load) {
+            return pool_min_load_worker(long_pool);
         }
         // Long pool full/unhealthy: overflow to an idle short-pool worker only.
-        if let Some(idx) = pool_idle_worker(workers, short_indices) {
+        if let Some(idx) = pool_idle_worker(short_pool) {
             return Some(idx);
         }
         // Short pool all busy: queue on long pool if it still has a worker.
-        if let Some(idx) = pool_min_load_worker(workers, long_indices) {
+        if let Some(idx) = pool_min_load_worker(long_pool) {
             return Some(idx);
         }
         // Long pool fully unhealthy and short pool busy: all-healthy min-load.
@@ -280,26 +304,23 @@ impl LengthStrategy {
     /// Short request (uncached < long_prefill_threshold).
     fn select_short_request(
         &self,
-        workers: &[Arc<dyn Worker>],
-        long_indices: &[usize],
-        short_indices: &[usize],
+        long_pool: &[(usize, usize, usize)],
+        short_pool: &[(usize, usize, usize)],
         min_load_idx: Option<usize>,
     ) -> Option<usize> {
-        let short_has_free = pool_has_free(workers, short_indices, self.short_pool_max_load);
-        if short_has_free {
-            return pool_min_load_worker(workers, short_indices);
+        if pool_has_free(short_pool, self.short_pool_max_load) {
+            return pool_min_load_worker(short_pool);
         }
         // Short pool full: overflow to long pool if it has a free worker.
-        let long_has_free = pool_has_free(workers, long_indices, self.long_pool_max_load);
-        if long_has_free {
-            return pool_min_load_worker(workers, long_indices);
+        if pool_has_free(long_pool, self.long_pool_max_load) {
+            return pool_min_load_worker(long_pool);
         }
         // Both full: queue on short pool if it has a worker.
-        if let Some(idx) = pool_min_load_worker(workers, short_indices) {
+        if let Some(idx) = pool_min_load_worker(short_pool) {
             return Some(idx);
         }
         // Short pool empty: queue on long pool if it has a worker.
-        if let Some(idx) = pool_min_load_worker(workers, long_indices) {
+        if let Some(idx) = pool_min_load_worker(long_pool) {
             return Some(idx);
         }
         // Both pools empty: all-healthy min-load.
@@ -317,36 +338,22 @@ fn is_long_pool(worker: &dyn Worker) -> bool {
         .is_some_and(|v| v == "long")
 }
 
-/// Does any worker in `pool` have `load() < max_load`?
-fn pool_has_free(workers: &[Arc<dyn Worker>], pool: &[usize], max_load: usize) -> bool {
-    pool.iter()
-        .any(|&i| workers[i].routing_state().load < max_load)
+/// Does any worker in `pool` have `load < max_load`?
+fn pool_has_free(pool: &[(usize, usize, usize)], max_load: usize) -> bool {
+    pool.iter().any(|&(_, load, _)| load < max_load)
 }
 
-/// Return the index of an idle (`load == 0`) worker in `pool`, if any.
-fn pool_idle_worker(workers: &[Arc<dyn Worker>], pool: &[usize]) -> Option<usize> {
-    pool.iter()
-        .copied()
-        .find(|&i| workers[i].routing_state().load == 0)
+/// Return the worker index of an idle (`load == 0`) entry, if any.
+fn pool_idle_worker(pool: &[(usize, usize, usize)]) -> Option<usize> {
+    pool.iter().find(|(_, load, _)| *load == 0).map(|(idx, _, _)| *idx)
 }
 
 /// Lowest-load worker in `pool` with the `(load, processed, idx)` tie-break.
 /// Returns `None` when `pool` is empty.
-fn pool_min_load_worker(workers: &[Arc<dyn Worker>], pool: &[usize]) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    let mut best_key: Option<(usize, usize, usize)> = None;
-    for &idx in pool {
-        let state = workers[idx].routing_state();
-        let key = (state.load, state.processed, idx);
-        match best_key {
-            Some(b) if key >= b => {}
-            _ => {
-                best = Some(idx);
-                best_key = Some(key);
-            }
-        }
-    }
-    best
+fn pool_min_load_worker(pool: &[(usize, usize, usize)]) -> Option<usize> {
+    pool.iter()
+        .min_by_key(|(idx, load, processed)| (*load, *processed, *idx))
+        .map(|(idx, _, _)| *idx)
 }
 
 /// Parse the `X-Prompt-Tokens` header into a token count. Returns `None` on
@@ -701,5 +708,93 @@ mod tests {
         };
         let idx = policy.select_worker(&workers, &info).unwrap();
         assert_eq!(workers[idx].url(), "http://w2:8000");
+    }
+
+    /// A partial cache hit below threshold must classify by the uncached
+    /// portion, not the full request size. A 200K-token request with 190K
+    /// matched → uncached = 10K < threshold → short pool, even though the
+    /// full request would have been "long."
+    #[test]
+    fn step4_partial_cache_hit_uses_uncached_not_full_size_tokens() {
+        let cfg = test_config();
+        let strategy = LengthStrategy {
+            chars_per_token: cfg.chars_per_token,
+            long_prefill_threshold: cfg.long_prefill_threshold,
+            long_pool_max_load: cfg.long_pool_max_load,
+            short_pool_max_load: cfg.short_pool_max_load,
+        };
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            make_worker("http://w1:8000", None, 0),
+            make_worker("http://w2:8000", Some("long"), 0),
+        ];
+        let healthy_indices: Vec<usize> = vec![0, 1];
+        // Hint: 200K total - 190K matched = 10K uncached < 100K threshold.
+        let hint = Some(UncachedHint::Tokens(10_000));
+        let info = SelectWorkerInfo::default();
+        let idx = strategy
+            .select_no_cache(&workers, &info, &healthy_indices, None, 0.0, "m", hint)
+            .unwrap();
+        assert_eq!(
+            workers[idx].url(),
+            "http://w1:8000",
+            "partial match (10K uncached < 100K threshold) → short pool"
+        );
+    }
+
+    /// Same scenario but via char hint: 400K chars total - 390K matched =
+    /// 10K uncached chars → 2500 tokens < 100K threshold → short pool.
+    #[test]
+    fn step4_partial_cache_hit_uses_uncached_not_full_size_chars() {
+        let cfg = test_config();
+        let strategy = LengthStrategy {
+            chars_per_token: cfg.chars_per_token,
+            long_prefill_threshold: cfg.long_prefill_threshold,
+            long_pool_max_load: cfg.long_pool_max_load,
+            short_pool_max_load: cfg.short_pool_max_load,
+        };
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            make_worker("http://w1:8000", None, 0),
+            make_worker("http://w2:8000", Some("long"), 0),
+        ];
+        let healthy_indices: Vec<usize> = vec![0, 1];
+        // 10K uncached chars / 4 chars_per_token = 2500 tokens < 100K threshold.
+        let hint = Some(UncachedHint::Chars(10_000));
+        let info = SelectWorkerInfo::default();
+        let idx = strategy
+            .select_no_cache(&workers, &info, &healthy_indices, None, 0.0, "m", hint)
+            .unwrap();
+        assert_eq!(
+            workers[idx].url(),
+            "http://w1:8000",
+            "partial match (10K uncached chars = 2500 tokens < 100K) → short pool"
+        );
+    }
+
+    /// Without a hint (no match at all), a 200K-token request stays "long"
+    /// via the header, proving the hint does not override when absent.
+    #[test]
+    fn step4_no_hint_falls_through_to_header() {
+        let cfg = test_config();
+        let strategy = LengthStrategy {
+            chars_per_token: cfg.chars_per_token,
+            long_prefill_threshold: cfg.long_prefill_threshold,
+            long_pool_max_load: cfg.long_pool_max_load,
+            short_pool_max_load: cfg.short_pool_max_load,
+        };
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            make_worker("http://w1:8000", None, 0),
+            make_worker("http://w2:8000", Some("long"), 0),
+        ];
+        let healthy_indices: Vec<usize> = vec![0, 1];
+        let headers = tokens_headers(200_000);
+        let info = info_with_header(&headers, "novel prompt");
+        let idx = strategy
+            .select_no_cache(&workers, &info, &healthy_indices, None, 0.0, "m", None)
+            .unwrap();
+        assert_eq!(
+            workers[idx].url(),
+            "http://w2:8000",
+            "no hint → header 200K > 100K threshold → long pool"
+        );
     }
 }

@@ -29,7 +29,7 @@ mod round_robin;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
-pub(crate) use cache_aware::NoCacheStrategy;
+pub(crate) use cache_aware::{NoCacheStrategy, UncachedHint};
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use cache_aware_length::CacheAwareLengthPolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;

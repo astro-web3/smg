@@ -3356,7 +3356,7 @@ mod tests {
         assert_eq!(first, second, "pool routing recorded tree → subsequent hit");
     }
 
-    // --- 补充场景 ---
+    // --- Additional scenarios ---
 
     // Step 3: cache hit but matched worker unhealthy → clean stale + first healthy
     #[tokio::test]
