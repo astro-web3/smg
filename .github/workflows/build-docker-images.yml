@@ -1,0 +1,211 @@
+name: Build Docker Images
+
+on:
+  push:
+    branches: ["main", "test"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}/1xtoken
+  CLUSTER_GOPROXY: https://proxy.golang.org
+  # 阿里云镜像仓库：国内服务器拉 ghcr.io 太慢，构建时同步推一份到阿里云
+  ALIYUN_REGISTRY: crpi-w0utadukedw6a9ld.cn-hangzhou.personal.cr.aliyuncs.com
+  ALIYUN_NAMESPACE: 1xtoken
+
+jobs:
+  # ------------------------------------------------------------------
+  # 阶段 1: 智能分析 (Configuration Job)
+  # ------------------------------------------------------------------
+  configure:
+    name: Configure Matrix
+    runs-on: astro-web3-arc-runner-set
+    outputs:
+      has-changes: ${{ steps.detect.outputs.has-changes }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes to build inputs
+        id: detect
+        run: |
+          # 只在影响镜像构建的文件变更时才触发构建，避免无关改动白白排队。
+          # workflow_dispatch 始终构建。
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.event.after }}"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BEFORE" "$AFTER" || true)
+          PATTERNS='^(docker/Dockerfile|\.cargo/config\.toml|bindings/python/pyproject\.toml|model_gateway/|crates/|Cargo\.lock)'
+          if printf '%s\n' "$CHANGED" | grep -qE "$PATTERNS"; then
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build matrix
+        id: matrix
+        run: |
+          # 单镜像仓库，matrix 只有一行；保留 include 结构便于后续多 app 扩展。
+          MATRIX=$(cat <<'JSON'
+          {"include":[{"app":"smg","dockerfile":"docker/Dockerfile","context":"."}]}
+          JSON
+          )
+          # jq -c 压成单行 JSON 给 fromJSON 用
+          echo "matrix=$(printf '%s' "$MATRIX" | jq -c .)" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------
+  # 阶段 2: 构建 (Build Job)
+  # ------------------------------------------------------------------
+  build-and-push:
+    name: Build ${{ matrix.app }}
+    needs: configure
+    if: needs.configure.outputs.has-changes == 'true'
+    runs-on: astro-web3-arc-runner-set
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.configure.outputs.matrix) }}
+    steps:
+      - name: Export pod env to GitHub env
+        run: |
+          echo "ZOT_REGISTRY=${ZOT_REGISTRY}" >> $GITHUB_ENV
+          echo "CLUSTER_GOPROXY=${CLUSTER_GOPROXY}" >> $GITHUB_ENV
+          echo "BUILDKIT_HOST=${BUILDKIT_HOST}" >> $GITHUB_ENV
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        id: setup-buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: remote
+          endpoint: ${{ env.BUILDKIT_HOST }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 阿里云镜像仓库偶发 TLS 握手超时（自建 runner 到杭州个人版实例网络抖动），
+      # docker/login-action 内部只 login 一次无重试，这里改成带退避的重试。
+      - name: Log in to Aliyun Registry
+        env:
+          ALIYUN_REGISTRY: ${{ env.ALIYUN_REGISTRY }}
+          ALIYUN_USERNAME: ${{ secrets.ALIYUN_USERNAME }}
+          ALIYUN_PASSWORD: ${{ secrets.ALIYUN_PASSWORD }}
+        run: |
+          max_attempts=5
+          for attempt in $(seq 1 "$max_attempts"); do
+            if printf '%s' "$ALIYUN_PASSWORD" | docker login "$ALIYUN_REGISTRY" -u "$ALIYUN_USERNAME" --password-stdin; then
+              echo "Aliyun login succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "Aliyun login attempt $attempt failed, backing off before retry..."
+            sleep $((attempt * 5))
+          done
+          echo "::error::Aliyun registry login failed after $max_attempts attempts"
+          exit 1
+
+      - name: Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.app }}
+            ${{ env.ZOT_REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.app }}
+            ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/1xtoken-${{ matrix.app }}
+          tags: |
+            type=sha,prefix=${{ github.ref_name }}-,suffix=-${{ github.run_number }}
+
+      # 构建与推送拆分：构建是确定性故障（pnpm install、Dockerfile 语法、编译错误），
+      # 重试无意义，失败直接在这一步标红并阻断 job，报错落在真实出错位置；
+      # 推送才可能因阿里云个人版仓库鉴权/网络抖动失败，值得退避重试。
+      - name: Build image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context || '.' }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: false
+          cache-from: type=registry,ref=${{ env.ZOT_REGISTRY }}/cache/${{ env.IMAGE_PREFIX }}-${{ matrix.app }}:buildcache
+          cache-to: type=registry,ref=${{ env.ZOT_REGISTRY }}/cache/${{ env.IMAGE_PREFIX }}-${{ matrix.app }}:buildcache,mode=min
+
+      # 阿里云鉴权端点偶发 connection reset by peer（push 时拉 oauth token 网络抖动），
+      # docker/build-push-action 内部不重试推送，这里用「首尝试 + 2 次退避重试 + 状态校验」兜底。
+      # 构建产物已在 BuildKit 缓存里，重试几乎只重推 manifest，成本可忽略。
+      - name: Push image
+        id: push-1
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context || '.' }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.ZOT_REGISTRY }}/cache/${{ env.IMAGE_PREFIX }}-${{ matrix.app }}:buildcache
+
+      - name: Retry push (attempt 2)
+        if: steps.push-1.outcome == 'failure'
+        run: |
+          echo "::warning::首次推送失败（可能阿里云鉴权端点网络抖动），退避 5s 后重试..."
+          sleep 5
+
+      - name: Push image (retry 2)
+        id: push-2
+        continue-on-error: true
+        if: steps.push-1.outcome == 'failure'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context || '.' }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.ZOT_REGISTRY }}/cache/${{ env.IMAGE_PREFIX }}-${{ matrix.app }}:buildcache
+
+      - name: Retry push (attempt 3)
+        if: steps.push-2.outcome == 'failure'
+        run: |
+          echo "::warning::第二次推送失败，退避 10s 后最后一次重试..."
+          sleep 10
+
+      - name: Push image (retry 3)
+        id: push-3
+        continue-on-error: true
+        if: steps.push-2.outcome == 'failure'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context || '.' }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.ZOT_REGISTRY }}/cache/${{ env.IMAGE_PREFIX }}-${{ matrix.app }}:buildcache
+
+      # 三次推送任一成功即通过；全败则标红并阻断 job。
+      - name: Verify push result
+        if: always()
+        run: |
+          if [ "${{ steps.push-1.outcome }}" = "success" ] \
+             || [ "${{ steps.push-2.outcome }}" = "success" ] \
+             || [ "${{ steps.push-3.outcome }}" = "success" ]; then
+            echo "镜像推送成功"
+          else
+            echo "::error::镜像推送在 3 次尝试后均失败（阿里云个人版仓库鉴权/网络问题）"
+            exit 1
+          fi
