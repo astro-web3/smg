@@ -782,11 +782,11 @@ impl ConfigValidator {
             });
         }
 
-        if *balance_rel_threshold < 1.0 {
+        if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
             return Err(ConfigError::InvalidValue {
                 field: "balance_rel_threshold".to_string(),
                 value: balance_rel_threshold.to_string(),
-                reason: "Must be >= 1.0".to_string(),
+                reason: "Must be finite and >= 1.0".to_string(),
             });
         }
 
@@ -1806,6 +1806,48 @@ mod tests {
         // Zero rejected.
         assert!(ConfigValidator::validate(&make(0.0, 1.0)).is_err());
         assert!(ConfigValidator::validate(&make(1.0, 0.0)).is_err());
+    }
+
+    #[test]
+    fn test_validate_cache_aware_length_rejects_non_finite_balance_rel_threshold() {
+        let make = |balance_rel_threshold: f32| {
+            RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec![
+                        "http://worker1:8000".to_string(),
+                        "http://worker2:8000".to_string(),
+                    ],
+                },
+                PolicyConfig::CacheAwareLength {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                    block_size: 16,
+                    balance_token_usage_threshold: 1.0,
+                    overload_token_usage_threshold: 1.0,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
+                    chars_per_token: 4,
+                    long_prefill_threshold: 100_000,
+                    long_pool_max_load: 4,
+                    short_pool_max_load: 32,
+                },
+            )
+        };
+
+        // Valid value passes.
+        assert!(ConfigValidator::validate(&make(1.1)).is_ok());
+        // NaN passes the < 1.0 check (NaN < 1.0 is false) but must be rejected.
+        assert!(ConfigValidator::validate(&make(f32::NAN)).is_err());
+        // Infinity must be rejected.
+        assert!(ConfigValidator::validate(&make(f32::INFINITY)).is_err());
+        // Below 1.0 rejected.
+        assert!(ConfigValidator::validate(&make(0.9)).is_err());
     }
 
     #[test]
