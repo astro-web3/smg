@@ -127,15 +127,19 @@ jobs:
         env:
           GHCR_TAG: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-smg:${{ steps.meta.outputs.version }}
           ALIYUN_TAG: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/1xtoken-smg:${{ steps.meta.outputs.version }}
-          SOURCE_IMAGE: ${{ steps.meta.outputs.tags }}
         run: |
-          # Get the first tag as source image (the metadata action produces multi-line output)
-          SOURCE_TAG=$(echo "$SOURCE_IMAGE" | head -n 1)
+          # Get the first tag from the build image ID (docker/build-push-action outputs image ID when load=true)
+          IMAGE_ID="${{ steps.build.outputs.imageid }}"
           
+          if [ -z "$IMAGE_ID" ]; then
+            echo "::error::Failed to get image ID from build step"
+            exit 1
+          fi
+
           # Tag for GHCR
-          docker tag "$SOURCE_TAG" "$GHCR_TAG"
+          docker tag "$IMAGE_ID" "$GHCR_TAG"
           # Tag for Aliyun
-          docker tag "$SOURCE_TAG" "$ALIYUN_TAG"
+          docker tag "$IMAGE_ID" "$ALIYUN_TAG"
 
           # Push to GHCR (retry on network jitter)
           for attempt in 1 2 3; do
