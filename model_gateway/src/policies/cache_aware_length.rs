@@ -74,7 +74,6 @@ pub struct CacheAwareLengthPolicy {
     inner: CacheAwarePolicy,
     #[allow(dead_code)]
     config: CacheAwareLengthConfig,
-    strategy: Arc<LengthStrategy>,
 }
 
 /// The no-cache strategy: selects a worker by splitting the healthy fleet
@@ -107,11 +106,10 @@ impl CacheAwareLengthPolicy {
             short_pool_max_load: config.short_pool_max_load,
         });
         let inner = CacheAwarePolicy::with_config(config.base.clone())
-            .with_no_cache_strategy(Arc::clone(&strategy) as Arc<dyn NoCacheStrategy>);
+            .with_no_cache_strategy(strategy as Arc<dyn NoCacheStrategy>);
         Self {
             inner,
             config,
-            strategy,
         }
     }
 

@@ -510,7 +510,7 @@ impl JobQueue {
                     } => {
                         let prefill_workers =
                             prefill_urls.iter().enumerate().map(|(i, (url, port))| {
-                                (url.clone(), "prefill", *port, long_indices.contains(&i))
+                                (url.clone(), "prefill", *port, is_long_pool_index(i, long_indices))
                             });
 
                         let decode_workers = decode_urls
@@ -530,7 +530,7 @@ impl JobQueue {
                             .map(|(url, port)| (url.clone(), "encode", *port, false));
                         let prefill_workers =
                             prefill_urls.iter().enumerate().map(|(i, (url, port))| {
-                                (url.clone(), "prefill", *port, long_indices.contains(&i))
+                                (url.clone(), "prefill", *port, is_long_pool_index(i, long_indices))
                             });
                         let decode_workers = decode_urls
                             .iter()
@@ -767,6 +767,12 @@ impl JobQueue {
     }
 }
 
+/// Whether prefill worker at `index` belongs to the long pool, determined by
+/// membership in `long_prefill_indices`.
+fn is_long_pool_index(index: usize, long_indices: &[usize]) -> bool {
+    long_indices.contains(&index)
+}
+
 /// Stamp the router-config-derived fields onto a startup worker's spec: the
 /// pinned runtime, the grouped-ZMQ engine count, and the connection budget.
 /// Identity fields (url, worker type, api key, bootstrap port) are the
@@ -996,7 +1002,9 @@ mod tests {
         let workers: Vec<(String, &str, Option<u16>, bool)> = prefill_urls
             .iter()
             .enumerate()
-            .map(|(i, (url, port))| (url.clone(), "prefill", *port, long_indices.contains(&i)))
+            .map(|(i, (url, port))| {
+                (url.clone(), "prefill", *port, is_long_pool_index(i, &long_indices))
+            })
             .collect();
 
         // P1 (index 0), P2 (index 1), P3 (index 2) → short pool (is_long_pool=false)
@@ -1041,7 +1049,9 @@ mod tests {
         let workers: Vec<(String, &str, Option<u16>, bool)> = prefill_urls
             .iter()
             .enumerate()
-            .map(|(i, (url, port))| (url.clone(), "prefill", *port, long_indices.contains(&i)))
+            .map(|(i, (url, port))| {
+                (url.clone(), "prefill", *port, is_long_pool_index(i, &long_indices))
+            })
             .collect();
 
         assert!(!workers[0].3, "no long indices → all short pool");
