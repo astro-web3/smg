@@ -242,6 +242,12 @@ class RouterArgs:
     worker_overload_protection: bool = False
     # Restore the conditional load-monitor poll gate (default: poll always)
     disable_load_monitoring: bool = False
+    # cache_aware_length policy: long/short pool split
+    chars_per_token: int = 4
+    long_prefill_threshold: int = 100_000
+    long_pool_max_load: int = 4
+    short_pool_max_load: int = 32
+    long_prefill_indices: list[int] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def add_cli_args(
@@ -676,6 +682,42 @@ class RouterArgs:
                 "Seconds a cache-affinity placement stays routable; should"
                 " approximate serving-engine cache retention. Defaults to 180."
             ),
+        )
+        # cache_aware_length policy parameters
+        routing_group.add_argument(
+            f"--{prefix}chars-per-token",
+            type=int,
+            default=RouterArgs.chars_per_token,
+            help="Divisor for char-level token estimation when X-Prompt-Tokens"
+            " is absent (cache_aware_length policy). Default 4.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}long-prefill-threshold",
+            type=int,
+            default=RouterArgs.long_prefill_threshold,
+            help="Uncached-prefill-token boundary between long and short"
+            " requests (cache_aware_length policy). Default 100000.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}long-pool-max-load",
+            type=int,
+            default=RouterArgs.long_pool_max_load,
+            help="Load ceiling for the long pool (pool=long workers)"
+            " (cache_aware_length policy). Default 4.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}short-pool-max-load",
+            type=int,
+            default=RouterArgs.short_pool_max_load,
+            help="Load ceiling for the short pool (remaining workers)"
+            " (cache_aware_length policy). Default 32.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}long-prefill-indices",
+            type=_parse_int_csv,
+            default=[],
+            help="Comma-separated 0-based indices of --prefill URLs that belong"
+            " to the long pool (get pool=long label for cache_aware_length).",
         )
         routing_group.add_argument(
             f"--{prefix}max-idle-secs",
