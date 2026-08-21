@@ -3340,4 +3340,54 @@ mod tests {
         let second = route_to_url(&router, prompt, None);
         assert_eq!(first, second, "pool routing recorded tree → subsequent hit");
     }
+
+    // --- 补充场景 ---
+
+    // Step 3: 命中但命中的 worker 不健康 → 清理 stale + 回退第一个健康 worker
+    #[tokio::test]
+    async fn cal_step3_hit_unhealthy_falls_back_to_first_healthy() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let prompt = "shared cache-building prompt for affinity test";
+        // 第一次：建立缓存
+        let first = route_to_url(&router, prompt, None);
+        // 标记被选中的 worker 不健康
+        mark_unhealthy(&router, &first);
+        // 第二次：相同 prompt 命中，但 worker 不健康 → 回退到另一个健康 worker
+        let second = route_to_url(&router, prompt, None);
+        assert_ne!(
+            second, first,
+            "unhealthy matched worker must not be selected"
+        );
+    }
+
+    // Step 4 ≥100K: 长池全不健康 + 短池有 load=0 worker → 长→短溢出到 idle worker
+    #[tokio::test]
+    async fn cal_step4_long_pool_unhealthy_overflows_to_idle_short() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        mark_unhealthy(&router, &url_l); // 长池全不健康
+                                         // 短池 worker idle (load 0)
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_s, "long pool all unhealthy → idle short worker");
+    }
+
+    // Step 4 token 源优先级：header 精确值覆盖字符级估算
+    #[tokio::test]
+    async fn cal_step4_header_overrides_char_estimate() {
+        // 短 prompt（字符估算 → 1 token → 短请求 → 短池），
+        // 但 header 传 200000（→ 长请求 → 长池）。
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "short", Some(&h));
+        assert_eq!(
+            routed, url_l,
+            "header (200K) must override char estimate (1 token) → long pool"
+        );
+    }
 }
