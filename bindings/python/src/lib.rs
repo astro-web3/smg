@@ -531,6 +531,7 @@ struct Router {
     long_prefill_threshold: usize,
     long_pool_max_load: usize,
     short_pool_max_load: usize,
+    long_prefill_indices: Vec<usize>,
 }
 
 impl Router {
@@ -955,6 +956,7 @@ impl Router {
                 self.server_key_path.as_ref(),
             )
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
+            .long_prefill_indices(self.long_prefill_indices.clone())
             .build()
     }
 }
@@ -1111,6 +1113,7 @@ impl Router {
         long_prefill_threshold = 100_000,
         long_pool_max_load = 4,
         short_pool_max_load = 32,
+        long_prefill_indices = vec![],
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1265,6 +1268,7 @@ impl Router {
         long_prefill_threshold: usize,
         long_pool_max_load: usize,
         short_pool_max_load: usize,
+        long_prefill_indices: Vec<usize>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1433,6 +1437,7 @@ impl Router {
             long_prefill_threshold,
             long_pool_max_load,
             short_pool_max_load,
+            long_prefill_indices,
         })
     }
 
