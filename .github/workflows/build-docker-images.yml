@@ -114,7 +114,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile.test
+          file: docker/Dockerfile
           push: false
           load: true
           platforms: linux/amd64
