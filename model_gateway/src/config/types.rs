@@ -644,23 +644,21 @@ pub enum PolicyConfig {
         cache_boundaries: Vec<usize>,
     },
 
-    /// Cache-aware length policy: cache affinity with a long/short pool split
-    /// driven by the `pool` worker label (`pool=long` → long pool, otherwise
-    /// short pool). Step 1-3 mirror `cache_aware` (string tree only); step 4
-    /// routes by uncached prefill tokens. See `policies/cache_aware_length.rs`.
+    /// Cache-aware length policy: a full superset of `cache_aware` that adds
+    /// a long/short pool split on the no-cache branch, driven by the `pool`
+    /// worker label (`pool=long` → long pool, otherwise short pool). Inherits
+    /// all cache_aware features (string tree, token tree, event-driven
+    /// routing, hash index, mesh sync, KV pressure). See
+    /// `policies/cache_aware_length.rs`.
     #[serde(rename = "cache_aware_length")]
     CacheAwareLength {
-        /// Minimum matched-prefix share before a request pins to a holder.
+        // --- Inherited from cache_aware ---
         #[serde(alias = "cache_match_threshold")]
         #[serde(default = "default_cal_cache_threshold")]
         cache_threshold: f32,
-        /// Spill gate, absolute part: the global imbalance fires when the
-        /// healthy-fleet load spread exceeds this.
         #[serde(alias = "spill_abs_threshold")]
         #[serde(default = "default_cal_balance_abs_threshold")]
         balance_abs_threshold: usize,
-        /// Spill gate, relative part (multiple of the healthy-fleet min load);
-        /// fires only together with `balance_abs_threshold`.
         #[serde(alias = "spill_rel_threshold")]
         #[serde(default = "default_cal_balance_rel_threshold")]
         balance_rel_threshold: f32,
@@ -668,17 +666,29 @@ pub enum PolicyConfig {
         eviction_interval_secs: u64,
         #[serde(default = "default_cal_max_tree_size")]
         max_tree_size: usize,
-        /// Divisor for char-level token estimation when `X-Prompt-Tokens` is
-        /// absent (default 4).
+        #[serde(default = "default_block_size")]
+        block_size: usize,
+        #[serde(default = "default_balance_token_usage_threshold")]
+        balance_token_usage_threshold: f32,
+        #[serde(default = "default_balance_token_usage_threshold")]
+        overload_token_usage_threshold: f32,
+        #[serde(default = "default_overlap_decay")]
+        overlap_decay: f32,
+        #[serde(default = "default_selection_temperature")]
+        selection_temperature: f32,
+        #[serde(default)]
+        cache_index: CacheIndexKind,
+        #[serde(default = "default_cache_ttl_secs")]
+        cache_ttl_secs: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cache_boundaries: Vec<usize>,
+        // --- Length-specific ---
         #[serde(default = "default_cal_chars_per_token")]
         chars_per_token: usize,
-        /// Uncached-prefill-token boundary between long and short requests.
         #[serde(default = "default_cal_long_prefill_threshold")]
         long_prefill_threshold: usize,
-        /// Load ceiling for the long pool (`pool=long` workers).
         #[serde(default = "default_cal_long_pool_max_load")]
         long_pool_max_load: usize,
-        /// Load ceiling for the short pool (remaining workers).
         #[serde(default = "default_cal_short_pool_max_load")]
         short_pool_max_load: usize,
     },

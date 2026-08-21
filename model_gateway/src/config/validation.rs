@@ -571,6 +571,14 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                block_size,
+                balance_token_usage_threshold,
+                overload_token_usage_threshold,
+                overlap_decay,
+                selection_temperature,
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
                 chars_per_token,
                 long_prefill_threshold,
                 long_pool_max_load,
@@ -637,6 +645,67 @@ impl ConfigValidator {
                         field: "short_pool_max_load".to_string(),
                         value: short_pool_max_load.to_string(),
                         reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                // ---- CacheAware-superset validations: added when
+                // cache_aware_length became a full superset of cache_aware.
+                // Mirrors the CacheAware arm above for the shared fields. ----
+                Self::validate_cache_boundaries(cache_boundaries)?;
+
+                if *cache_ttl_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache_ttl_secs".to_string(),
+                        value: cache_ttl_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *cache_index == CacheIndexKind::Hash && cache_boundaries.is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache_index".to_string(),
+                        value: "hash".to_string(),
+                        reason: "cache_index=hash requires non-empty cache_boundaries".to_string(),
+                    });
+                }
+
+                if !overlap_decay.is_finite() || *overlap_decay < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "overlap_decay".to_string(),
+                        value: overlap_decay.to_string(),
+                        reason: "Must be finite and >= 0.0 (0.0 disables)".to_string(),
+                    });
+                }
+
+                if !selection_temperature.is_finite() || *selection_temperature < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "selection_temperature".to_string(),
+                        value: selection_temperature.to_string(),
+                        reason: "Must be finite and >= 0.0 (0.0 is argmax)".to_string(),
+                    });
+                }
+
+                if *block_size == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "block_size".to_string(),
+                        value: block_size.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *balance_token_usage_threshold <= 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "balance_token_usage_threshold".to_string(),
+                        value: balance_token_usage_threshold.to_string(),
+                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
+                    });
+                }
+
+                if *overload_token_usage_threshold <= 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "overload_token_usage_threshold".to_string(),
+                        value: overload_token_usage_threshold.to_string(),
+                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
                     });
                 }
             }
