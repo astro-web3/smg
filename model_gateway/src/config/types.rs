@@ -20,6 +20,10 @@ pub struct RouterConfig {
     pub mode: RoutingMode,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
+    /// 0-based indices of `--prefill` URLs that belong to the long pool
+    /// (get `pool=long` label for cache_aware_length). Empty = no long pool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub long_prefill_indices: Vec<usize>,
     /// Explicit runtime for the startup workers (`--worker-urls`), set from
     /// `--backend` when the connection mode is ZMQ. The ZMQ handshake is shared
     /// across engine runtimes, so the wire protocol cannot be probed and must
@@ -1119,6 +1123,7 @@ impl Default for RouterConfig {
             },
             policy: PolicyConfig::Random,
             cache_boundaries: Vec::new(),
+            long_prefill_indices: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,

@@ -72,6 +72,8 @@ const HEADER_PROMPT_TOKENS: &str = "x-prompt-tokens";
 #[derive(Debug)]
 pub struct CacheAwareLengthPolicy {
     inner: CacheAwarePolicy,
+    #[allow(dead_code)]
+    config: CacheAwareLengthConfig,
     strategy: Arc<LengthStrategy>,
 }
 
@@ -104,9 +106,13 @@ impl CacheAwareLengthPolicy {
             long_pool_max_load: config.long_pool_max_load,
             short_pool_max_load: config.short_pool_max_load,
         });
-        let inner = CacheAwarePolicy::with_config(config.base)
+        let inner = CacheAwarePolicy::with_config(config.base.clone())
             .with_no_cache_strategy(Arc::clone(&strategy) as Arc<dyn NoCacheStrategy>);
-        Self { inner, strategy }
+        Self {
+            inner,
+            config,
+            strategy,
+        }
     }
 
     // --- Delegated setters (forward to inner CacheAwarePolicy) ---
@@ -133,6 +139,12 @@ impl CacheAwareLengthPolicy {
 
     pub fn remove_worker_by_url(&self, url: &str) {
         self.inner.remove_worker_by_url(url);
+    }
+
+    /// Test-only access to the config so factory tests can verify values.
+    #[cfg(test)]
+    pub(crate) fn config_for_test(&self) -> &CacheAwareLengthConfig {
+        &self.config
     }
 }
 
