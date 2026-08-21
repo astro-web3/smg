@@ -24,8 +24,8 @@ use openai_protocol::{
 };
 use smg::{
     policies::{
-        BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
-        RoundRobinPolicy, SelectWorkerInfo,
+        BucketPolicy, CacheAwareLengthPolicy, CacheAwarePolicy, LoadBalancingPolicy,
+        PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy, SelectWorkerInfo,
     },
     routers::grpc::{backend_client::BackendClient, utils::process_chat_messages},
     worker::{
@@ -346,6 +346,7 @@ pub unsafe extern "C" fn sgl_multi_client_create(
         "random" => Arc::new(RandomPolicy::new()),
         "power_of_two" | "poweroftwo" => Arc::new(PowerOfTwoPolicy::new()),
         "cache_aware" | "cacheaware" => Arc::new(CacheAwarePolicy::new()),
+        "cache_aware_length" | "cacheawarelength" => Arc::new(CacheAwareLengthPolicy::new()),
         "bucket" => Arc::new(BucketPolicy::new()),
         "consistent_hashing" | "consistenthashing" | "prefix_hash" | "prefixhash" | "manual" => {
             set_error_message(
@@ -353,7 +354,7 @@ pub unsafe extern "C" fn sgl_multi_client_create(
                 &format!(
                     "Policy '{policy_name_str}' is not supported in the SDK. It requires HTTP headers \
                      and/or a hash ring which are not available at the FFI layer. \
-                     Supported policies: round_robin, random, power_of_two, cache_aware, bucket"
+                     Supported policies: round_robin, random, power_of_two, cache_aware, cache_aware_length, bucket"
                 ),
             );
             return ptr::null_mut();
@@ -363,7 +364,7 @@ pub unsafe extern "C" fn sgl_multi_client_create(
                 error_out,
                 &format!(
                     "Unknown policy: '{policy_name_str}'. \
-                     Supported policies: round_robin, random, power_of_two, cache_aware, bucket"
+                     Supported policies: round_robin, random, power_of_two, cache_aware, cache_aware_length, bucket"
                 ),
             );
             return ptr::null_mut();
