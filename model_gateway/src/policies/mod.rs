@@ -29,6 +29,7 @@ mod round_robin;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
+pub(crate) use cache_aware::NoCacheStrategy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use cache_aware_length::CacheAwareLengthPolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
@@ -201,20 +202,17 @@ impl Default for CacheAwareConfig {
 }
 
 /// Configuration for the cache_aware_length policy (long/short pool split).
+///
+/// Embeds [`CacheAwareConfig`] as `base` so the policy inherits all
+/// cache_aware features (string tree, token tree, event-driven routing,
+/// hash index, mesh sync, KV pressure) and adds 4 length-specific fields
+/// for the no-cache long/short pool split.
 #[derive(Debug, Clone)]
 pub struct CacheAwareLengthConfig {
-    /// Min matched-prefix share before a request pins to a holder (0.0-1.0).
-    pub cache_threshold: f32,
-    /// Absolute load diff for the global imbalance check (step 2).
-    pub balance_abs_threshold: usize,
-    /// Relative load ratio for the global imbalance check (step 2); fires
-    /// only together with `balance_abs_threshold`.
-    pub balance_rel_threshold: f32,
-    /// Interval between LRU eviction cycles (seconds). `0` disables.
-    pub eviction_interval_secs: u64,
-    /// Max total chars of each model's approximate string tree, shared across
-    /// all workers; enforced by eviction.
-    pub max_tree_size: usize,
+    /// Full cache_aware configuration: cache_threshold, balance thresholds,
+    /// eviction, block_size, KV pressure knobs, overlap decay, selection
+    /// temperature, cache_index, cache_ttl_secs, cache_boundaries.
+    pub base: CacheAwareConfig,
     /// Divisor for char-level token estimation when `X-Prompt-Tokens` is
     /// absent: `uncached_tokens = (input_chars - matched_chars) /
     /// chars_per_token`.
@@ -230,11 +228,7 @@ pub struct CacheAwareLengthConfig {
 impl Default for CacheAwareLengthConfig {
     fn default() -> Self {
         Self {
-            cache_threshold: 0.3,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 30,
-            max_tree_size: 10000,
+            base: CacheAwareConfig::default(),
             chars_per_token: 4,
             long_prefill_threshold: 100_000,
             // 0 would reject every worker as non-free; pick generous defaults so

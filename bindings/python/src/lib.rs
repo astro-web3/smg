@@ -20,6 +20,7 @@ pub enum PolicyType {
     RoundRobin,
     Passthrough,
     CacheAware,
+    CacheAwareLength,
     PowerOfTwo,
     LeastLoad,
     Bucket,
@@ -526,6 +527,10 @@ struct Router {
     worker_overload_token_usage: Option<f64>,
     worker_overload_protection: bool,
     disable_load_monitoring: bool,
+    chars_per_token: usize,
+    long_prefill_threshold: usize,
+    long_pool_max_load: usize,
+    short_pool_max_load: usize,
 }
 
 impl Router {
@@ -628,6 +633,25 @@ impl Router {
                     cache_index: self.parse_cache_index()?,
                     cache_ttl_secs: self.cache_ttl_secs,
                     cache_boundaries: self.cache_boundaries.clone(),
+                },
+                PolicyType::CacheAwareLength => ConfigPolicyConfig::CacheAwareLength {
+                    cache_threshold: self.cache_threshold,
+                    balance_abs_threshold: self.balance_abs_threshold,
+                    balance_rel_threshold: self.balance_rel_threshold,
+                    eviction_interval_secs: self.eviction_interval_secs,
+                    max_tree_size: self.max_tree_size,
+                    block_size: self.block_size,
+                    balance_token_usage_threshold: self.balance_token_usage_threshold,
+                    overload_token_usage_threshold: self.overload_token_usage_threshold,
+                    overlap_decay: self.overlap_decay,
+                    selection_temperature: self.selection_temperature,
+                    cache_index: self.parse_cache_index()?,
+                    cache_ttl_secs: self.cache_ttl_secs,
+                    cache_boundaries: self.cache_boundaries.clone(),
+                    chars_per_token: self.chars_per_token,
+                    long_prefill_threshold: self.long_prefill_threshold,
+                    long_pool_max_load: self.long_pool_max_load,
+                    short_pool_max_load: self.short_pool_max_load,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: self.load_monitor_interval,
@@ -1083,6 +1107,10 @@ impl Router {
         worker_overload_token_usage = None,
         worker_overload_protection = false,
         disable_load_monitoring = false,
+        chars_per_token = 4,
+        long_prefill_threshold = 100_000,
+        long_pool_max_load = 4,
+        short_pool_max_load = 32,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1233,6 +1261,10 @@ impl Router {
         worker_overload_token_usage: Option<f64>,
         worker_overload_protection: bool,
         disable_load_monitoring: bool,
+        chars_per_token: usize,
+        long_prefill_threshold: usize,
+        long_pool_max_load: usize,
+        short_pool_max_load: usize,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1397,6 +1429,10 @@ impl Router {
             worker_overload_token_usage,
             worker_overload_protection,
             disable_load_monitoring,
+            chars_per_token,
+            long_prefill_threshold,
+            long_pool_max_load,
+            short_pool_max_load,
         })
     }
 

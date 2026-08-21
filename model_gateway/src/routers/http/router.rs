@@ -2494,6 +2494,14 @@ mod tests {
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 0,
             max_tree_size: 4096,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
             chars_per_token: 4,
             long_prefill_threshold: 100_000,
             long_pool_max_load: 2,
@@ -3227,7 +3235,7 @@ mod tests {
         assert_eq!(routed, url_l, "long full + short busy → queue on long pool");
     }
 
-    // Step 4: long pool全不健康 + 短池都 load>0 → 全部健康 worker min-load.
+    // Step 4: long pool all unhealthy + short pool all load>0 → all-healthy min-load.
     #[tokio::test]
     async fn cal_step4_long_unhealthy_short_busy_all_healthy_min_load() {
         let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
@@ -3349,18 +3357,19 @@ mod tests {
 
     // --- 补充场景 ---
 
-    // Step 3: 命中但命中的 worker 不健康 → 清理 stale + 回退第一个健康 worker
+    // Step 3: cache hit but matched worker unhealthy → clean stale + first healthy
     #[tokio::test]
     async fn cal_step3_hit_unhealthy_falls_back_to_first_healthy() {
         let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
         let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
         let router = length_router(&[&url_s], &[&url_l]).await;
         let prompt = "shared cache-building prompt for affinity test";
-        // 第一次：建立缓存
+        // First request: seed the cache
         let first = route_to_url(&router, prompt, None);
-        // 标记被选中的 worker 不健康
+        // Mark the selected worker unhealthy
         mark_unhealthy(&router, &first);
-        // 第二次：相同 prompt 命中，但 worker 不健康 → 回退到另一个健康 worker
+        // Second request: same prompt hits cache, but matched worker is
+        // unhealthy → fall back to another healthy worker
         let second = route_to_url(&router, prompt, None);
         assert_ne!(
             second, first,
@@ -3368,24 +3377,24 @@ mod tests {
         );
     }
 
-    // Step 4 ≥100K: 长池全不健康 + 短池有 load=0 worker → 长→短溢出到 idle worker
+    // Step 4 ≥100K: long pool all unhealthy + short pool has load=0 worker → long→short overflow to idle worker
     #[tokio::test]
     async fn cal_step4_long_pool_unhealthy_overflows_to_idle_short() {
         let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
         let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
         let router = length_router(&[&url_s], &[&url_l]).await;
-        mark_unhealthy(&router, &url_l); // 长池全不健康
-                                         // 短池 worker idle (load 0)
+        mark_unhealthy(&router, &url_l); // long pool all unhealthy
+                                         // short pool worker idle (load 0)
         let h = tokens_header(200_000);
         let routed = route_to_url(&router, "novel", Some(&h));
         assert_eq!(routed, url_s, "long pool all unhealthy → idle short worker");
     }
 
-    // Step 4 token 源优先级：header 精确值覆盖字符级估算
+    // Step 4 token source priority: header exact value overrides char estimate
     #[tokio::test]
     async fn cal_step4_header_overrides_char_estimate() {
-        // 短 prompt（字符估算 → 1 token → 短请求 → 短池），
-        // 但 header 传 200000（→ 长请求 → 长池）。
+        // Short prompt (char estimate → 1 token → short request → short pool),
+        // but header says 200000 (→ long request → long pool).
         let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
         let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
         let router = length_router(&[&url_s], &[&url_l]).await;
@@ -3394,6 +3403,68 @@ mod tests {
         assert_eq!(
             routed, url_l,
             "header (200K) must override char estimate (1 token) → long pool"
+        );
+    }
+
+    // --- Full HTTP path via route_typed_request ---
+
+    /// Construct a minimal CompletionRequest for routing tests.
+    fn completion_request(prompt: &str) -> CompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "",
+            "prompt": prompt,
+            "stream": false,
+        }))
+        .unwrap()
+    }
+
+    /// E2E via route_typed_request: a header-classified long request routes
+    /// to the long-pool worker, and the response carries x-smg-routed-worker-id.
+    #[tokio::test]
+    async fn cal_http_long_request_routes_to_long_pool() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let headers = tokens_header(200_000);
+        let resp = router
+            .route_typed_request(
+                Some(&headers),
+                completion_request("novel prompt"),
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let routed = resp
+            .headers()
+            .get("x-smg-routed-worker-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(routed, url_l, "header-classified long request → long pool");
+    }
+
+    /// E2E via route_typed_request: an all-unhealthy fleet returns 503.
+    #[tokio::test]
+    async fn cal_http_all_unhealthy_returns_503() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        mark_unhealthy(&router, &url_s);
+        mark_unhealthy(&router, &url_l);
+        let resp = router
+            .route_typed_request(
+                None,
+                completion_request("hello"),
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "all unhealthy → 503"
         );
     }
 }
