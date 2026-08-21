@@ -390,6 +390,12 @@ struct CliArgs {
     #[arg(long, default_value_t = 32, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
     short_pool_max_load: usize,
 
+    /// Comma-separated 0-based indices of --prefill URLs that belong to the
+    /// long pool (get pool=long label for cache_aware_length). E.g. "3,4"
+    /// marks the 4th and 5th prefill workers as long pool.
+    #[arg(long, value_delimiter = ',', help_heading = "PD Disaggregation")]
+    long_prefill_indices: Vec<usize>,
+
     /// How long an unused sticky routing key stays pinned: keys idle beyond
     /// this many seconds are evicted from the manual-policy / sticky-session
     /// map
@@ -1806,6 +1812,7 @@ impl CliArgs {
             .mode(mode)
             .policy(policy)
             .cache_boundaries(self.cache_boundaries.clone())
+            .long_prefill_indices(self.long_prefill_indices.clone())
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.zmq_engine_count)
