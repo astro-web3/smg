@@ -149,16 +149,37 @@ RUN apt update -y \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version && protoc --version
 
-# copy source code
+# Dependency pre-build layer: copy only manifests (Cargo.toml/Cargo.lock) and
+# create dummy lib.rs/main.rs for every crate so `cargo build` compiles all
+# dependencies into the BuildKit layer cache. When source changes but
+# Cargo.toml/Cargo.lock don't, this layer is a cache hit — skipping the ~10min
+# dependency download+compile, leaving only the fast business-code rebuild.
+COPY --from=local_src /src/Cargo.toml /src/Cargo.lock /opt/smg/
+COPY --from=local_src /src/model_gateway/Cargo.toml /opt/smg/model_gateway/Cargo.toml
+COPY --from=local_src /src/crates/ /opt/smg/crates/
+COPY --from=local_src /src/bindings/python/Cargo.toml /opt/smg/bindings/python/Cargo.toml
+COPY --from=local_src /src/bindings/python/pyproject.toml /opt/smg/bindings/python/pyproject.toml
+
+# Create dummy source files so cargo can resolve the workspace graph.
+RUN cd /opt/smg \
+    && find . -name 'Cargo.toml' -exec dirname {} \; | while read d; do \
+         mkdir -p "$d/src"; \
+         [ -f "$d/src/lib.rs" ] || echo '' > "$d/src/lib.rs"; \
+         [ -f "$d/src/main.rs" ] || echo 'fn main() {}' > "$d/src/main.rs"; \
+       done \
+    && uv pip install maturin \
+    && cd bindings/python \
+    && ulimit -n 65536 && timeout 1200 maturin build --release --features vendored-openssl,opencv-video --out dist || true
+
+# Now copy the real source, overwriting the dummy files. Only this layer
+# re-runs on business-code changes; the dependency layer above is cached.
 COPY --from=local_src /src /opt/smg
 
 # working directory
 WORKDIR /opt/smg
 
-# install maturin and build the wheel with vendored OpenSSL
-RUN uv pip install maturin \
-    && cargo clean \
-    && rm -rf bindings/python/dist/ \
+# Build the actual wheel. `cargo clean` removed — it defeated layer caching.
+RUN rm -rf bindings/python/dist/ \
     && cd bindings/python \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl,opencv-video --out dist \
     && rm -rf /root/.cache
