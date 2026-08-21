@@ -147,7 +147,11 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                 .policy_registry
                 .get_policy(&model_id)
                 .is_some_and(|policy| policy.name() == "cache_aware");
-            if cache_aware {
+            let cache_aware_length = app_context
+                .policy_registry
+                .get_policy(&model_id)
+                .is_some_and(|policy| policy.name() == "cache_aware_length");
+            if cache_aware || cache_aware_length {
                 app_context
                     .policy_registry
                     .init_cache_aware_policy(&model_id, &all_workers);

@@ -209,13 +209,18 @@ impl LoadBalancingPolicy for CacheAwareLengthPolicy {
 
         // Step 1: health filter — single O(workers) gather reading each worker
         // once via routing_state() (health + load + processed under one guard).
+        // Cache load/processed into a snapshot Vec so step 2 and the pool
+        // helpers never re-read routing_state(), avoiding guard traffic and
+        // torn reads between healthy_max and pool selection.
         let mut healthy_indices: Vec<usize> = Vec::with_capacity(workers.len());
+        let mut healthy_loads: Vec<usize> = Vec::with_capacity(workers.len());
         let mut min_key: Option<(usize, usize, usize)> = None;
         let mut min_load_idx: Option<usize> = None;
         for (idx, worker) in workers.iter().enumerate() {
             let state = worker.routing_state();
             if state.eligible() {
                 healthy_indices.push(idx);
+                healthy_loads.push(state.load);
                 let key = (state.load, state.processed, idx);
                 match min_key {
                     Some(best) if key >= best => {}
@@ -234,13 +239,9 @@ impl LoadBalancingPolicy for CacheAwareLengthPolicy {
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id()).to_string();
 
         // Step 2: global imbalance check (same formula as cache_aware).
-        // The min/max are over the healthy fleet only.
+        // The min/max are over the healthy fleet only, from the step-1 snapshot.
         let healthy_min = min_key.map(|(load, _, _)| load).unwrap_or(0);
-        let healthy_max = healthy_indices
-            .iter()
-            .map(|&i| workers[i].routing_state().load)
-            .max()
-            .unwrap_or(0);
+        let healthy_max = *healthy_loads.iter().max().unwrap_or(&0);
         let abs_diff = healthy_max.saturating_sub(healthy_min);
         let rel_threshold = self.config.balance_rel_threshold * healthy_min as f32;
         if abs_diff > self.config.balance_abs_threshold && healthy_max as f32 > rel_threshold {
@@ -343,21 +344,9 @@ impl LoadBalancingPolicy for CacheAwareLengthPolicy {
             .collect();
 
         let selected = if uncached >= self.config.long_prefill_threshold {
-            self.select_long_request(
-                workers,
-                &long_indices,
-                &short_indices,
-                &healthy_indices,
-                min_load_idx,
-            )
+            self.select_long_request(workers, &long_indices, &short_indices, min_load_idx)
         } else {
-            self.select_short_request(
-                workers,
-                &long_indices,
-                &short_indices,
-                &healthy_indices,
-                min_load_idx,
-            )
+            self.select_short_request(workers, &long_indices, &short_indices, min_load_idx)
         };
 
         // Step 5: record tree + return.
@@ -426,8 +415,9 @@ impl CacheAwareLengthPolicy {
 
     /// Compute uncached prefill tokens by priority:
     /// 1. X-Prompt-Tokens header (exact).
-    /// 2. (input_chars - matched_chars) / chars_per_token (char estimate).
-    /// 3. None when neither is computable.
+    /// 2. info.tokens length (token-only requests with no text, e.g. gRPC).
+    /// 3. (input_chars - matched_chars) / chars_per_token (char estimate).
+    /// 4. None when neither is computable.
     fn compute_uncached_tokens(
         &self,
         info: &SelectWorkerInfo,
@@ -437,7 +427,13 @@ impl CacheAwareLengthPolicy {
         if let Some(n) = parse_prompt_tokens_header(info.headers) {
             return Some(n);
         }
-        // 2. Char-level estimate from the match result.
+        // 2. Token-only request (no text): use the token count directly.
+        if let Some(tokens) = info.tokens {
+            if !tokens.is_empty() {
+                return Some(tokens.len());
+            }
+        }
+        // 3. Char-level estimate from the match result.
         let uncached_chars = result
             .input_char_count
             .saturating_sub(result.matched_char_count);
@@ -456,7 +452,6 @@ impl CacheAwareLengthPolicy {
         workers: &[Arc<dyn Worker>],
         long_indices: &[usize],
         short_indices: &[usize],
-        _healthy_indices: &[usize],
         min_load_idx: Option<usize>,
     ) -> Option<usize> {
         let long_has_free = pool_has_free(workers, long_indices, self.config.long_pool_max_load);
@@ -482,7 +477,6 @@ impl CacheAwareLengthPolicy {
         workers: &[Arc<dyn Worker>],
         long_indices: &[usize],
         short_indices: &[usize],
-        _healthy_indices: &[usize],
         min_load_idx: Option<usize>,
     ) -> Option<usize> {
         let short_has_free = pool_has_free(workers, short_indices, self.config.short_pool_max_load);
@@ -934,6 +928,32 @@ mod tests {
             workers[idx].url(),
             "http://w2:8000",
             "header (200K) must override char estimate (1 token) → long pool"
+        );
+    }
+
+    /// Token-only request (no text, no header): uses info.tokens length as
+    /// uncached token count. 200K tokens → long request → long pool.
+    #[test]
+    fn step4_token_only_request_uses_token_count() {
+        let policy = CacheAwareLengthPolicy::with_config(test_config());
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            make_worker("http://w1:8000", None, 0),         // short pool
+            make_worker("http://w2:8000", Some("long"), 0), // long pool
+        ];
+        policy.init_workers(&workers);
+
+        // Simulate a token-only request (gRPC path): no text, tokens present.
+        let tokens: Vec<u32> = (0..200_000).collect();
+        let info = SelectWorkerInfo {
+            request_text: None,
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let idx = policy.select_worker(&workers, &info).unwrap();
+        assert_eq!(
+            workers[idx].url(),
+            "http://w2:8000",
+            "token-only request with 200K tokens → long pool"
         );
     }
 }
