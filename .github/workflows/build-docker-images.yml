@@ -21,7 +21,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       has-changes: ${{ steps.detect.outputs.has-changes }}
-      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -51,32 +50,17 @@ jobs:
             echo "has-changes=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build matrix
-        id: matrix
-        run: |
-          # 单镜像仓库，matrix 只有一行；保留 include 结构便于后续多 app 扩展。
-          MATRIX=$(cat <<'JSON'
-          {"include":[{"app":"smg","dockerfile":"docker/Dockerfile","context":"."}]}
-          JSON
-          )
-          # jq -c 压成单行 JSON 给 fromJSON 用
-          echo "matrix=$(printf '%s' "$MATRIX" | jq -c .)" >> "$GITHUB_OUTPUT"
-
   # ------------------------------------------------------------------
   # 阶段 2: 构建 (Build Job)
   # ------------------------------------------------------------------
   build-and-push:
-    name: Build ${{ matrix.app }}
+    name: Build smg image
     needs: configure
     if: needs.configure.outputs.has-changes == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(needs.configure.outputs.matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -116,8 +100,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.app }}
-            ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/1xtoken-${{ matrix.app }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-smg
+            ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/1xtoken-smg
           tags: |
             type=sha,prefix=${{ github.ref_name }}-,suffix=-${{ github.run_number }}
 
@@ -127,8 +111,8 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.context || '.' }}
-          file: ${{ matrix.dockerfile }}
+          context: .
+          file: docker/Dockerfile
           push: false
           load: false
           cache-from: type=gha
@@ -141,8 +125,8 @@ jobs:
         continue-on-error: true
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.context || '.' }}
-          file: ${{ matrix.dockerfile }}
+          context: .
+          file: docker/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
@@ -159,8 +143,8 @@ jobs:
         if: steps.push-1.outcome == 'failure'
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.context || '.' }}
-          file: ${{ matrix.dockerfile }}
+          context: .
+          file: docker/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
@@ -177,8 +161,8 @@ jobs:
         if: steps.push-2.outcome == 'failure'
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.context || '.' }}
-          file: ${{ matrix.dockerfile }}
+          context: .
+          file: docker/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
