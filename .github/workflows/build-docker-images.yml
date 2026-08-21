@@ -127,15 +127,15 @@ jobs:
         env:
           GHCR_TAG: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-smg:${{ steps.meta.outputs.version }}
           ALIYUN_TAG: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/1xtoken-smg:${{ steps.meta.outputs.version }}
+          SOURCE_IMAGE: ${{ steps.meta.outputs.tags }}
         run: |
-          # Tag for both registries
-          docker tag ${{ steps.meta.outputs.tags }} "$GHCR_TAG" 2>/dev/null || true
-          docker tag ${{ steps.meta.outputs.tags }} "$ALIYUN_TAG" 2>/dev/null || true
-          # Also tag with the full metadata tags (may include multiple)
-          IFS=$'\n' read -d '' -ra TAGS <<< "${{ steps.meta.outputs.tags }}" || true
-          for tag in "${TAGS[@]}"; do
-            docker tag "${TAGS[0]}" "$tag" 2>/dev/null || true
-          done
+          # Get the first tag as source image (the metadata action produces multi-line output)
+          SOURCE_TAG=$(echo "$SOURCE_IMAGE" | head -n 1)
+          
+          # Tag for GHCR
+          docker tag "$SOURCE_TAG" "$GHCR_TAG"
+          # Tag for Aliyun
+          docker tag "$SOURCE_TAG" "$ALIYUN_TAG"
 
           # Push to GHCR (retry on network jitter)
           for attempt in 1 2 3; do
