@@ -517,19 +517,23 @@ impl ConfigValidator {
                     });
                 }
 
-                if *balance_token_usage_threshold <= 0.0 {
+                if !balance_token_usage_threshold.is_finite()
+                    || *balance_token_usage_threshold <= 0.0
+                {
                     return Err(ConfigError::InvalidValue {
                         field: "balance_token_usage_threshold".to_string(),
                         value: balance_token_usage_threshold.to_string(),
-                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
+                        reason: "Must be finite and > 0.0 (use >= 1.0 to disable)".to_string(),
                     });
                 }
 
-                if *overload_token_usage_threshold <= 0.0 {
+                if !overload_token_usage_threshold.is_finite()
+                    || *overload_token_usage_threshold <= 0.0
+                {
                     return Err(ConfigError::InvalidValue {
                         field: "overload_token_usage_threshold".to_string(),
                         value: overload_token_usage_threshold.to_string(),
-                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
+                        reason: "Must be finite and > 0.0 (use >= 1.0 to disable)".to_string(),
                     });
                 }
 
@@ -693,19 +697,23 @@ impl ConfigValidator {
                     });
                 }
 
-                if *balance_token_usage_threshold <= 0.0 {
+                if !balance_token_usage_threshold.is_finite()
+                    || *balance_token_usage_threshold <= 0.0
+                {
                     return Err(ConfigError::InvalidValue {
                         field: "balance_token_usage_threshold".to_string(),
                         value: balance_token_usage_threshold.to_string(),
-                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
+                        reason: "Must be finite and > 0.0 (use >= 1.0 to disable)".to_string(),
                     });
                 }
 
-                if *overload_token_usage_threshold <= 0.0 {
+                if !overload_token_usage_threshold.is_finite()
+                    || *overload_token_usage_threshold <= 0.0
+                {
                     return Err(ConfigError::InvalidValue {
                         field: "overload_token_usage_threshold".to_string(),
                         value: overload_token_usage_threshold.to_string(),
-                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
+                        reason: "Must be finite and > 0.0 (use >= 1.0 to disable)".to_string(),
                     });
                 }
             }

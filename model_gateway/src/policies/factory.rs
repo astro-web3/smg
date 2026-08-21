@@ -238,6 +238,18 @@ mod tests {
             short_pool_max_load: 32,
         });
         assert_eq!(policy.name(), "cache_aware_length");
+        // Verify config values are preserved, not just the policy name.
+        let cal = policy
+            .as_any()
+            .downcast_ref::<CacheAwareLengthPolicy>()
+            .unwrap();
+        let cfg = cal.config_for_test();
+        assert_eq!(cfg.chars_per_token, 4);
+        assert_eq!(cfg.long_prefill_threshold, 100_000);
+        assert_eq!(cfg.long_pool_max_load, 4);
+        assert_eq!(cfg.short_pool_max_load, 32);
+        assert_eq!(cfg.base.cache_threshold, 0.5);
+        assert_eq!(cfg.base.block_size, 16);
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Bucket {
             balance_abs_threshold: 10,

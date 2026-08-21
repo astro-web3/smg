@@ -508,15 +508,14 @@ impl JobQueue {
                         decode_urls,
                         ..
                     } => {
-                        let prefill_workers = prefill_urls
-                            .iter()
-                            .enumerate()
-                            .map(|(i, (url, port))| {
+                        let prefill_workers =
+                            prefill_urls.iter().enumerate().map(|(i, (url, port))| {
                                 (url.clone(), "prefill", *port, long_indices.contains(&i))
                             });
 
-                        let decode_workers =
-                            decode_urls.iter().map(|url| (url.clone(), "decode", None, false));
+                        let decode_workers = decode_urls
+                            .iter()
+                            .map(|url| (url.clone(), "decode", None, false));
 
                         prefill_workers.chain(decode_workers).collect()
                     }
@@ -529,14 +528,13 @@ impl JobQueue {
                         let encode_workers = encode_urls
                             .iter()
                             .map(|(url, port)| (url.clone(), "encode", *port, false));
-                        let prefill_workers = prefill_urls
-                            .iter()
-                            .enumerate()
-                            .map(|(i, (url, port))| {
+                        let prefill_workers =
+                            prefill_urls.iter().enumerate().map(|(i, (url, port))| {
                                 (url.clone(), "prefill", *port, long_indices.contains(&i))
                             });
-                        let decode_workers =
-                            decode_urls.iter().map(|url| (url.clone(), "decode", None, false));
+                        let decode_workers = decode_urls
+                            .iter()
+                            .map(|url| (url.clone(), "decode", None, false));
 
                         encode_workers
                             .chain(prefill_workers)
@@ -576,8 +574,7 @@ impl JobQueue {
                     spec.api_key.clone_from(&api_key);
                     spec.bootstrap_port = bootstrap_port;
                     if is_long_pool {
-                        spec.labels
-                            .insert("pool".to_string(), "long".to_string());
+                        spec.labels.insert("pool".to_string(), "long".to_string());
                     }
                     apply_startup_worker_config(&mut spec, router_config);
                     let config = spec;
@@ -999,9 +996,7 @@ mod tests {
         let workers: Vec<(String, &str, Option<u16>, bool)> = prefill_urls
             .iter()
             .enumerate()
-            .map(|(i, (url, port))| {
-                (url.clone(), "prefill", *port, long_indices.contains(&i))
-            })
+            .map(|(i, (url, port))| (url.clone(), "prefill", *port, long_indices.contains(&i)))
             .collect();
 
         // P1 (index 0), P2 (index 1), P3 (index 2) → short pool (is_long_pool=false)
@@ -1046,9 +1041,7 @@ mod tests {
         let workers: Vec<(String, &str, Option<u16>, bool)> = prefill_urls
             .iter()
             .enumerate()
-            .map(|(i, (url, port))| {
-                (url.clone(), "prefill", *port, long_indices.contains(&i))
-            })
+            .map(|(i, (url, port))| (url.clone(), "prefill", *port, long_indices.contains(&i)))
             .collect();
 
         assert!(!workers[0].3, "no long indices → all short pool");
