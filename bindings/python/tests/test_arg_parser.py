@@ -1438,3 +1438,27 @@ class TestRouterArgsFieldOrder:
                 f"{appended} must be appended after worker_startup_delay to "
                 "preserve positional callers"
             )
+
+    def test_cache_aware_length_cli_args(self):
+        """Test --chars-per-token, --long-prefill-* CLI args are parsed."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            [
+                "--chars-per-token",
+                "8",
+                "--long-prefill-threshold",
+                "200000",
+                "--long-pool-max-load",
+                "10",
+                "--short-pool-max-load",
+                "64",
+                "--long-prefill-indices",
+                "0,2",
+            ]
+        )
+        assert args.chars_per_token == 8
+        assert args.long_prefill_threshold == 200000
+        assert args.long_pool_max_load == 10
+        assert args.short_pool_max_load == 64
+        assert args.long_prefill_indices == [0, 2]
