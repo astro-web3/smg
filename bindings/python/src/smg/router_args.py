@@ -15,6 +15,7 @@ COMMON_POLICY_CHOICES = [
     "round_robin",
     "passthrough",
     "cache_aware",
+    "cache_aware_length",
     "power_of_two",
     "least_load",
     "manual",
@@ -633,6 +634,7 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}eviction-interval-secs",
+            f"--{prefix}eviction-interval",
             type=int,
             default=RouterArgs.eviction_interval_secs,
             help="Interval in seconds between cache eviction operations",
@@ -1723,6 +1725,25 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        if (self.prefill_urls or self.decode_urls) and not (
+            self.pd_disaggregation or self.epd_disaggregation
+        ):
+            raise ValueError(
+                "--prefill/--decode require --pd-disaggregation or --epd-disaggregation"
+            )
+
+        if len(set(self.long_prefill_indices)) != len(self.long_prefill_indices):
+            raise ValueError("--long-prefill-indices must not contain duplicate values")
+
+        if self.long_prefill_indices:
+            if min(self.long_prefill_indices) < 0:
+                raise ValueError("--long-prefill-indices values must be non-negative")
+            if max(self.long_prefill_indices) >= len(self.prefill_urls):
+                raise ValueError(
+                    "--long-prefill-indices value out of range for "
+                    f"{len(self.prefill_urls)} configured prefill workers"
+                )
+
         # Validate configuration based on mode
         if self.epd_disaggregation:
             if self.encode_policy:
