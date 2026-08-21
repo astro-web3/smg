@@ -1777,6 +1777,52 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_cache_aware_length_rejects_nan_thresholds() {
+        let make = |balance_token_usage_threshold: f32,
+                    overload_token_usage_threshold: f32| {
+            RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec![
+                        "http://worker1:8000".to_string(),
+                        "http://worker2:8000".to_string(),
+                    ],
+                },
+                PolicyConfig::CacheAwareLength {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                    block_size: 16,
+                    balance_token_usage_threshold,
+                    overload_token_usage_threshold,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
+                    chars_per_token: 4,
+                    long_prefill_threshold: 100_000,
+                    long_pool_max_load: 4,
+                    short_pool_max_load: 32,
+                },
+            )
+        };
+
+        // Valid defaults pass.
+        assert!(ConfigValidator::validate(&make(1.0, 1.0)).is_ok());
+        // NaN rejected for both fields.
+        assert!(ConfigValidator::validate(&make(f32::NAN, 1.0)).is_err());
+        assert!(ConfigValidator::validate(&make(1.0, f32::NAN)).is_err());
+        // Infinity rejected for both fields.
+        assert!(ConfigValidator::validate(&make(f32::INFINITY, 1.0)).is_err());
+        assert!(ConfigValidator::validate(&make(1.0, f32::INFINITY)).is_err());
+        // Zero rejected.
+        assert!(ConfigValidator::validate(&make(0.0, 1.0)).is_err());
+        assert!(ConfigValidator::validate(&make(1.0, 0.0)).is_err());
+    }
+
+    #[test]
     fn test_validate_cache_index_fields() {
         let make = |cache_index: CacheIndexKind, cache_ttl_secs: u64, boundaries: Vec<usize>| {
             RouterConfig::new(
