@@ -1,0 +1,206 @@
+name: Build Docker Images
+
+on:
+  push:
+    branches: ["main", "test"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}/1xtoken
+  # 阿里云镜像仓库：国内服务器拉 ghcr.io 太慢，构建时同步推一份到阿里云
+  ALIYUN_REGISTRY: crpi-w0utadukedw6a9ld.cn-hangzhou.personal.cr.aliyuncs.com
+  ALIYUN_NAMESPACE: 1xtoken
+
+jobs:
+  # ------------------------------------------------------------------
+  # 阶段 1: 智能分析 (Configuration Job)
+  # ------------------------------------------------------------------
+  configure:
+    name: Configure Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      has-changes: ${{ steps.detect.outputs.has-changes }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes to build inputs
+        id: detect
+        run: |
+          # 只在影响镜像构建的文件变更时才触发构建，避免无关改动白白排队。
+          # workflow_dispatch 始终构建。
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.event.after }}"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BEFORE" "$AFTER" || true)
+          PATTERNS='^(docker/Dockerfile|\.cargo/config\.toml|bindings/python/|bindings/golang/|model_gateway/|crates/|Cargo\.lock)'
+          if printf '%s\n' "$CHANGED" | grep -qE "$PATTERNS"; then
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ------------------------------------------------------------------
+  # 阶段 2: 构建 (Build Job)
+  # ------------------------------------------------------------------
+  build-and-push:
+    name: Build smg image
+    needs: configure
+    if: needs.configure.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 阿里云镜像仓库偶发 TLS 握手超时，docker/login-action 内部只 login 一次无重试，
+      # 这里改成带退避的重试。
+      - name: Log in to Aliyun Registry
+        env:
+          ALIYUN_REGISTRY: ${{ env.ALIYUN_REGISTRY }}
+          ALIYUN_USERNAME: ${{ secrets.ALIYUN_USERNAME }}
+          ALIYUN_PASSWORD: ${{ secrets.ALIYUN_PASSWORD }}
+        run: |
+          max_attempts=5
+          for attempt in $(seq 1 "$max_attempts"); do
+            if printf '%s' "$ALIYUN_PASSWORD" | docker login "$ALIYUN_REGISTRY" -u "$ALIYUN_USERNAME" --password-stdin; then
+              echo "Aliyun login succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "Aliyun login attempt $attempt failed, backing off before retry..."
+            sleep $((attempt * 5))
+          done
+          echo "::error::Aliyun registry login failed after $max_attempts attempts"
+          exit 1
+
+      - name: Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-smg
+            ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/1xtoken-smg
+          tags: |
+            type=sha,prefix=${{ github.ref_name }}-,suffix=-${{ github.run_number }}
+
+      # Build once, load into local Docker (not BuildKit remote push).
+      # This avoids the OCI manifest format (vnd.oci.empty.v1+json) that
+      # Aliyun personal registry rejects. `docker push` uses Docker v2
+      # manifest schema which is universally compatible.
+      - name: Build image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      # Tag the loaded image for both registries, then push with `docker push`
+      # (Docker v2 manifest format — compatible with Aliyun personal registry).
+      - name: Tag and push to registries
+        env:
+          GHCR_TAG: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-smg:${{ steps.meta.outputs.version }}
+          ALIYUN_TAG: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/1xtoken-smg:${{ steps.meta.outputs.version }}
+        run: |
+          # Get the first tag from the build image ID (docker/build-push-action outputs image ID when load=true)
+          IMAGE_ID="${{ steps.build.outputs.imageid }}"
+          
+          if [ -z "$IMAGE_ID" ]; then
+            echo "::error::Failed to get image ID from build step"
+            exit 1
+          fi
+
+          # Tag for GHCR
+          docker tag "$IMAGE_ID" "$GHCR_TAG"
+          # Tag for Aliyun
+          docker tag "$IMAGE_ID" "$ALIYUN_TAG"
+
+          # Push to GHCR (retry on network jitter)
+          for attempt in 1 2 3; do
+            if docker push "$GHCR_TAG"; then
+              echo "GHCR push succeeded on attempt $attempt"
+              break
+            fi
+            echo "GHCR push attempt $attempt failed, backing off..."
+            sleep $((attempt * 5))
+            if [ "$attempt" = "3" ]; then
+              echo "::error::GHCR push failed after 3 attempts"
+              exit 1
+            fi
+          done
+
+          # Push to Aliyun (retry on network jitter)
+          for attempt in 1 2 3; do
+            if docker push "$ALIYUN_TAG"; then
+              echo "Aliyun push succeeded on attempt $attempt"
+              break
+            fi
+            echo "Aliyun push attempt $attempt failed, backing off..."
+            sleep $((attempt * 5))
+            if [ "$attempt" = "3" ]; then
+              echo "::error::Aliyun push failed after 3 attempts"
+              exit 1
+            fi
+          done
+
+          echo "镜像推送成功"
+
+      - name: Publish image info to summary
+        if: always()
+        env:
+          GHCR_TAG: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-smg:${{ steps.meta.outputs.version }}
+          ALIYUN_TAG: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/1xtoken-smg:${{ steps.meta.outputs.version }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          {
+            echo "## Docker Image Build"
+            echo ""
+            if [ "$BUILD_OUTCOME" = "success" ]; then
+              echo "✅ Build and push succeeded"
+              echo ""
+              echo "| Registry | Image |"
+              echo "| --- | --- |"
+              echo "| GHCR | \`${GHCR_TAG}\` |"
+              echo "| Aliyun | \`${ALIYUN_TAG}\` |"
+              echo ""
+              echo "### Pull command"
+              echo ""
+              echo '```bash'
+              echo "# From GHCR (fast, international)"
+              echo "docker pull ${GHCR_TAG}"
+              echo ""
+              echo "# From Aliyun (fast, domestic China)"
+              echo "docker pull ${ALIYUN_TAG}"
+              echo '```'
+            else
+              echo "❌ Build failed"
+              echo ""
+              echo "Check the logs above for details."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
