@@ -14,6 +14,7 @@ use crate::{
 
 mod bucket;
 mod cache_aware;
+mod cache_aware_length;
 mod consistent_hashing;
 mod dp_min_token;
 mod factory;
@@ -29,6 +30,7 @@ pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
+pub use cache_aware_length::CacheAwareLengthPolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
@@ -194,6 +196,51 @@ impl Default for CacheAwareConfig {
             cache_index: CacheIndexKind::Tree,
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+        }
+    }
+}
+
+/// Configuration for the cache_aware_length policy (long/short pool split).
+#[derive(Debug, Clone)]
+pub struct CacheAwareLengthConfig {
+    /// Min matched-prefix share before a request pins to a holder (0.0-1.0).
+    pub cache_threshold: f32,
+    /// Absolute load diff for the global imbalance check (step 2).
+    pub balance_abs_threshold: usize,
+    /// Relative load ratio for the global imbalance check (step 2); fires
+    /// only together with `balance_abs_threshold`.
+    pub balance_rel_threshold: f32,
+    /// Interval between LRU eviction cycles (seconds). `0` disables.
+    pub eviction_interval_secs: u64,
+    /// Max total chars of each model's approximate string tree, shared across
+    /// all workers; enforced by eviction.
+    pub max_tree_size: usize,
+    /// Divisor for char-level token estimation when `X-Prompt-Tokens` is
+    /// absent: `uncached_tokens = (input_chars - matched_chars) /
+    /// chars_per_token`.
+    pub chars_per_token: usize,
+    /// Uncached-prefill-token boundary between long and short requests.
+    pub long_prefill_threshold: usize,
+    /// Load ceiling for the long pool (`pool=long` workers).
+    pub long_pool_max_load: usize,
+    /// Load ceiling for the short pool (remaining workers).
+    pub short_pool_max_load: usize,
+}
+
+impl Default for CacheAwareLengthConfig {
+    fn default() -> Self {
+        Self {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 30,
+            max_tree_size: 10000,
+            chars_per_token: 4,
+            long_prefill_threshold: 100_000,
+            // 0 would reject every worker as non-free; pick generous defaults so
+            // the policy is usable out of the box before operators tune.
+            long_pool_max_load: 4,
+            short_pool_max_load: 32,
         }
     }
 }

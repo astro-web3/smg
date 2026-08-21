@@ -53,11 +53,12 @@ use crate::{
     policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
         common::{
-            header_utils, overload,
+            attach_sized_body, header_utils, overload,
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
+            request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, is_retryable_status, RetryExecutor},
             sse::SSE_CHANNEL_BUFFER,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
@@ -348,10 +349,10 @@ impl Router {
         }
     }
 
-    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
+    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
-        typed_req: &T,
+        typed_req: T,
         route: &'static str,
         model_id: &str,
     ) -> Response {
@@ -369,7 +370,10 @@ impl Router {
         let text = routing_tokens
             .is_none()
             .then(|| typed_req.extract_text_for_routing());
-        let rid_key = self.policy_registry.derive_rid_key(typed_req.rid());
+        let rid_key = self
+            .policy_registry
+            .derive_rid_key(typed_req.rid())
+            .map(str::to_string);
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not,
@@ -395,47 +399,87 @@ impl Router {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
-        let response = RetryExecutor::execute_response_with_retry(
-            retry_config,
-            // operation per attempt
-            |_: u32| async {
-                let res = self
-                    .route_typed_request_once(
-                        headers,
-                        typed_req,
-                        route,
-                        model_id,
-                        canonical_model.as_deref(),
-                        is_stream,
-                        text.as_deref(),
-                        routing_tokens.as_deref(),
-                        rid_key,
-                    )
-                    .await;
-
-                // Need to be outside `route_typed_request_once` because that function has multiple return paths
-                Metrics::record_router_upstream_response(
-                    metrics_labels::ROUTER_HTTP,
-                    res.status().as_u16(),
-                    extract_error_code_from_response(&res),
-                );
-
-                res
+        // The lease owns the parsed request and its routing derivatives for
+        // the dispatch phase; its release point encodes the retry policy.
+        let lease = RequestLease::new(
+            typed_req,
+            RoutingDerivatives {
+                tokens: routing_tokens,
+                text,
+                rid_key,
             },
-            // should_retry predicate
-            |res, _attempt| is_retryable_response(res),
-            // on_backoff hook
-            |delay, attempt| {
-                // Layer 3 worker metrics
-                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
-                Metrics::record_worker_retry_backoff(attempt, delay);
-            },
-            // on_exhausted hook
-            || {
+            ReleasePoint::from_retry_config(retry_config),
+        );
+
+        let response = if lease.release_point() == ReleasePoint::AfterDispatch {
+            // Retries disabled: one dispatch; the lease frees the parsed
+            // request the moment the upstream bytes are serialized.
+            let res = self
+                .route_typed_request_once(
+                    headers,
+                    &lease,
+                    route,
+                    model_id,
+                    canonical_model.as_deref(),
+                    is_stream,
+                )
+                .await;
+            Metrics::record_router_upstream_response(
+                metrics_labels::ROUTER_HTTP,
+                res.status().as_u16(),
+                extract_error_code_from_response(&res),
+            );
+            // Mirror the retry executor's exhaustion accounting for a
+            // retryable response that gets no retry.
+            if is_retryable_response(&res) {
                 Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
-            },
-        )
-        .await;
+            }
+            res
+        } else {
+            RetryExecutor::execute_response_with_retry(
+                retry_config,
+                // operation per attempt; the lease keeps the request alive
+                // for replay until the retry window closes (first
+                // non-retryable response).
+                |_: u32| async {
+                    let res = self
+                        .route_typed_request_once(
+                            headers,
+                            &lease,
+                            route,
+                            model_id,
+                            canonical_model.as_deref(),
+                            is_stream,
+                        )
+                        .await;
+
+                    // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                    Metrics::record_router_upstream_response(
+                        metrics_labels::ROUTER_HTTP,
+                        res.status().as_u16(),
+                        extract_error_code_from_response(&res),
+                    );
+
+                    res
+                },
+                // should_retry predicate
+                |res, _attempt| is_retryable_response(res),
+                // on_backoff hook
+                |delay, attempt| {
+                    // Layer 3 worker metrics
+                    Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                    Metrics::record_worker_retry_backoff(attempt, delay);
+                },
+                // on_exhausted hook
+                || {
+                    Metrics::record_worker_retries_exhausted(
+                        metrics_labels::WORKER_REGULAR,
+                        endpoint,
+                    );
+                },
+            )
+            .await
+        };
 
         if response.status().is_success() {
             let duration = start.elapsed();
@@ -461,23 +505,18 @@ impl Router {
         response
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "per-attempt state threaded from route_typed_request; a struct would only move the arity"
-    )]
-    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
+    async fn route_typed_request_once<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
-        typed_req: &T,
+        lease: &RequestLease<T>,
         route: &'static str,
         model_id: &str,
         canonical_model: Option<&str>,
         is_stream: bool,
-        text: Option<&str>,
-        tokens: Option<&[u32]>,
-        rid_key: Option<&str>,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, text, tokens, headers, rid_key) {
+        let worker = match lease.with_view(|view| {
+            self.select_worker_for_model(model_id, view.text, view.tokens, headers, view.rid_key)
+        }) {
             Some(w) => w,
             None => {
                 // Distinguish "no workers for this model" from "workers exist but unavailable"
@@ -519,10 +558,13 @@ impl Router {
 
         // Keyed-load accounting uses the same effective key as selection:
         // rid-derived first, header fallback.
-        let load_guard = WorkerLoadGuard::with_key(
-            worker.clone(),
-            rid_key.or_else(|| self.policy_registry.sticky_header_key(headers)),
-        );
+        let load_guard = lease.with_view(|view| {
+            WorkerLoadGuard::with_key(
+                worker.clone(),
+                view.rid_key
+                    .or_else(|| self.policy_registry.sticky_header_key(headers)),
+            )
+        });
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -530,17 +572,33 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        let response = self
-            .send_typed_request(
-                headers,
-                typed_req,
-                route,
-                canonical_model,
-                worker.as_ref(),
-                is_stream,
-                load_guard,
-            )
-            .await;
+        let response = match lease.serialize_with(|view| {
+            serialize_request_body(view.request, canonical_model, worker.as_ref())
+        }) {
+            Ok(body) => {
+                // Past this point dispatch needs only the serialized bytes;
+                // the lease frees the parsed request and its routing
+                // derivatives now when retries are disabled.
+                lease.release_dispatch();
+                self.send_serialized_request(
+                    headers,
+                    body,
+                    route,
+                    worker.as_ref(),
+                    is_stream,
+                    load_guard,
+                )
+                .await
+            }
+            Err(RequestBodyError::Serialize(e)) => error::bad_request(
+                "serialization_failed",
+                format!("Failed to serialize request body: {e}"),
+            ),
+            Err(RequestBodyError::Prepare(e)) => error::bad_request(
+                "request_preparation_failed",
+                format!("Failed to prepare request: {e}"),
+            ),
+        };
 
         events::RequestReceivedEvent {}.emit();
 
@@ -1111,21 +1169,14 @@ impl Router {
         Ok(body.freeze())
     }
 
-    // Send typed request directly without conversion.
-    //
-    // `canonical_model` is set only when the client addressed the model by an
-    // alias. The worker was registered under the canonical ID and has never
-    // heard of the alias, so the body it receives carries the canonical name.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "per-request state threaded from route_typed_request_once; a struct would only move the arity"
-    )]
-    async fn send_typed_request<T: serde::Serialize>(
+    // Send an already-serialized request body. The stale-connection resend
+    // guard inside `send_with_stale_conn_retry` shares the body allocation by
+    // refcount, so the bytes live exactly until the response head arrives.
+    async fn send_serialized_request(
         &self,
         headers: Option<&HeaderMap>,
-        typed_req: &T,
+        body: Bytes,
         route: &'static str,
-        canonical_model: Option<&str>,
         worker: &dyn Worker,
         is_stream: bool,
         load_guard: WorkerLoadGuard,
@@ -1133,27 +1184,12 @@ impl Router {
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
-        let body = match serialize_request_body(typed_req, canonical_model, worker) {
-            Ok(body) => body,
-            Err(RequestBodyError::Serialize(e)) => {
-                return error::bad_request(
-                    "serialization_failed",
-                    format!("Failed to serialize request body: {e}"),
-                );
-            }
-            Err(RequestBodyError::Prepare(e)) => {
-                return error::bad_request(
-                    "request_preparation_failed",
-                    format!("Failed to prepare request: {e}"),
-                );
-            }
-        };
-
-        let mut request_builder = self
-            .client
-            .post(&endpoint_url)
-            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-            .body(body);
+        let mut request_builder = attach_sized_body(
+            self.client
+                .post(&endpoint_url)
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            body,
+        );
 
         request_builder = header_utils::apply_forwarded_request_headers(
             request_builder,
@@ -1381,7 +1417,7 @@ impl Router {
     /// The worker body read is capped at `max_body_bytes`; a larger body is a
     /// misbehaving worker and yields a 502.
     async fn build_rerank_response(
-        req: &RerankRequest,
+        req: RerankResponseSpec,
         canonical_model: Option<&str>,
         response: Response,
         max_body_bytes: usize,
@@ -1420,8 +1456,8 @@ impl Router {
                 );
             }
         };
-        let model = canonical_model.map_or_else(|| req.model.clone(), ToOwned::to_owned);
-        let mut rerank_response = RerankResponse::new(rerank_results, model, req.rid.clone());
+        let model = canonical_model.map_or(req.model, ToOwned::to_owned);
+        let mut rerank_response = RerankResponse::new(rerank_results, model, req.rid);
         // Sorting is handled by Python worker (serving_rerank.py)
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
@@ -1430,6 +1466,26 @@ impl Router {
             rerank_response.drop_documents();
         }
         Json(rerank_response).into_response()
+    }
+}
+
+/// Post-dispatch inputs for the rerank response builder; the request itself
+/// (documents included) is released at dispatch.
+struct RerankResponseSpec {
+    model: String,
+    rid: Option<openai_protocol::common::StringOrArray>,
+    top_k: Option<usize>,
+    return_documents: bool,
+}
+
+impl From<&RerankRequest> for RerankResponseSpec {
+    fn from(req: &RerankRequest) -> Self {
+        Self {
+            model: req.model.clone(),
+            rid: req.rid.clone(),
+            top_k: req.top_k,
+            return_documents: req.return_documents,
+        }
     }
 }
 
@@ -1806,7 +1862,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &GenerateRequest,
+        body: GenerateRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/generate", model_id)
@@ -1817,7 +1873,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &ChatCompletionRequest,
+        body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
@@ -1828,7 +1884,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &CreateMessageRequest,
+        body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/messages", model_id)
@@ -1839,7 +1895,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &CompletionRequest,
+        body: CompletionRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/completions", model_id)
@@ -1850,7 +1906,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &ResponsesRequest,
+        body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/responses", model_id)
@@ -1866,7 +1922,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &EmbeddingRequest,
+        body: EmbeddingRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/embeddings", model_id)
@@ -1877,7 +1933,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &ClassifyRequest,
+        body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/classify", model_id)
@@ -1906,16 +1962,17 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &RerankRequest,
+        body: RerankRequest,
         model_id: &str,
     ) -> Response {
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
+        let response_spec = RerankResponseSpec::from(&body);
         let response = self
             .route_typed_request(headers, body, "/v1/rerank", model_id)
             .await;
         if response.status().is_success() {
             Self::build_rerank_response(
-                body,
+                response_spec,
                 canonical_model.as_deref(),
                 response,
                 self.max_payload_size,
@@ -2065,7 +2122,8 @@ mod tests {
     use super::*;
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
-        policies::CacheAwarePolicy,
+        policies::{CacheAwareLengthPolicy, CacheAwarePolicy},
+        routers::common::request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
         worker::BasicWorkerBuilder,
     };
 
@@ -2255,7 +2313,9 @@ mod tests {
         let limit = body.len();
         let upstream = Response::new(Body::from(body));
 
-        let response = Router::build_rerank_response(&req, None, upstream, limit).await;
+        let response =
+            Router::build_rerank_response(RerankResponseSpec::from(&req), None, upstream, limit)
+                .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -2272,7 +2332,9 @@ mod tests {
         let limit = body.len() - 1;
         let upstream = Response::new(Body::from(body));
 
-        let response = Router::build_rerank_response(&req, None, upstream, limit).await;
+        let response =
+            Router::build_rerank_response(RerankResponseSpec::from(&req), None, upstream, limit)
+                .await;
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -2411,6 +2473,32 @@ mod tests {
             .worker_type(WorkerType::Regular)
             .health_config(no_health_check())
             .build()
+    }
+
+    /// Like `plain_worker` but attaches a `pool=<pool>` label so the
+    /// cache_aware_length policy can split workers into long/short pools.
+    fn labeled_worker(url: &str, pool: Option<&str>) -> crate::worker::BasicWorker {
+        let mut builder = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check());
+        if let Some(p) = pool {
+            builder = builder.label("pool", p);
+        }
+        builder.build()
+    }
+
+    fn cache_aware_length_policy() -> PolicyConfig {
+        PolicyConfig::CacheAwareLength {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 4096,
+            chars_per_token: 4,
+            long_prefill_threshold: 100_000,
+            long_pool_max_load: 2,
+            short_pool_max_load: 2,
+        }
     }
 
     type CapturedUpstreamRequest = Arc<tokio::sync::Mutex<Option<(HeaderMap, Bytes)>>>;
@@ -2819,6 +2907,96 @@ mod tests {
             .is_err());
     }
 
+    /// With retries disabled the parsed request must be freed at dispatch:
+    /// the upstream stub refuses to answer until the probe's only remaining
+    /// holder is the test itself.
+    #[tokio::test]
+    async fn disabled_retries_release_parsed_request_before_upstream_responds() {
+        let probe = Arc::new(());
+        let (url, released) = spawn_release_gated_stub(Arc::downgrade(&probe)).await;
+        let mut router =
+            streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        router.retry_config = RetryConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
+
+        let req = DropProbeRequest {
+            text: "hello".to_string(),
+            _probe: Arc::clone(&probe),
+        };
+        let response = router
+            .route_typed_request(None, req, "/generate", crate::worker::UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            released.load(AtomicOrdering::SeqCst),
+            "the parsed request must be freed before the upstream answers"
+        );
+    }
+
+    /// With retries enabled the request must survive for replay: a 503 on the
+    /// first attempt is retried with an identical body.
+    #[tokio::test]
+    async fn enabled_retries_replay_an_identical_body() {
+        use tokio::sync::Mutex;
+
+        let bodies: Arc<Mutex<Vec<Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&bodies);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(move |body: Bytes| {
+                let sink = Arc::clone(&sink);
+                let hits = Arc::clone(&hits_clone);
+                async move {
+                    sink.lock().await.push(body);
+                    if hits.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                        (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response()
+                    } else {
+                        (StatusCode::OK, "{}").into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&format!("http://{addr}"))],
+        );
+        router.retry_config = RetryConfig {
+            max_retries: 2,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            ..Default::default()
+        };
+
+        let req = DropProbeRequest {
+            text: "replay me".to_string(),
+            _probe: Arc::new(()),
+        };
+        let response = router
+            .route_typed_request(None, req, "/generate", crate::worker::UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies.len(), 2, "503 then 200 must mean two attempts");
+        assert_eq!(bodies[0], bodies[1], "the retry must replay the same body");
+    }
+
     #[tokio::test]
     async fn mutating_worker_falls_back_to_buffered() {
         let worker = BasicWorkerBuilder::new("http://worker1:8080")
@@ -2834,5 +3012,388 @@ mod tests {
     async fn missing_worker_falls_back_to_buffered() {
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
         assert_falls_back_with_body_intact(&router).await;
+    }
+
+    // ===== cache_aware_length E2E: all 16 decision-table scenarios =====
+    //
+    // Each test drives the real routing decision point
+    // (`select_worker_for_model`), which builds the exact `SelectWorkerInfo`
+    // (request_text + headers) the policy receives in production — the same
+    // path the buffered HTTP request takes. Workers carry `pool=long` labels;
+    // pre-set loads use WorkerLoadGuard + mem::forget (same as the unit tests).
+
+    /// Pin a worker's in-flight load at `load` for the lifetime of the test by
+    /// leaking the RAII guard (the process tears down on test exit). Accepts
+    /// the registered `Arc<dyn Worker>` directly — no downcast needed since
+    /// `WorkerLoadGuard::new` takes `Arc<dyn Worker>`.
+    fn pin_load(worker: &Arc<dyn Worker>, load: usize) {
+        for _ in 0..load {
+            std::mem::forget(WorkerLoadGuard::new(Arc::clone(worker), None));
+        }
+    }
+
+    /// Spawn a two-pool router: short workers (no label) + long workers
+    /// (`pool=long`), with cache_aware_length as the default policy and trees
+    /// seeded. Returns the router so tests can assert routed worker.
+    async fn length_router(short_urls: &[&str], long_urls: &[&str]) -> Router {
+        let mut workers: Vec<crate::worker::BasicWorker> = Vec::new();
+        for u in short_urls {
+            workers.push(labeled_worker(u, None));
+        }
+        for u in long_urls {
+            workers.push(labeled_worker(u, Some("long")));
+        }
+        let router = streaming_router(cache_aware_length_policy(), 1024 * 1024, workers);
+        let live = router.worker_registry.get_all();
+        router
+            .policy_registry
+            .get_default_policy()
+            .as_any()
+            .downcast_ref::<CacheAwareLengthPolicy>()
+            .unwrap()
+            .init_workers(&live);
+        router
+    }
+
+    /// Route `prompt` through the real `select_worker_for_model` (the exact
+    /// path a buffered HTTP request takes), returning the selected worker's
+    /// URL — the value the router writes to `x-smg-routed-worker-id`.
+    /// Returns `None` when the fleet rejects (503). Panics if the selection
+    /// unexpectedly fails (use `route_or_none` for the reject case).
+    fn route_to_url(router: &Router, prompt: &str, headers: Option<&HeaderMap>) -> String {
+        router
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                Some(prompt),
+                None,
+                headers,
+                None,
+            )
+            .map(|w| w.url().to_string())
+            .expect("selection should succeed with healthy workers")
+    }
+
+    /// Like `route_to_url` but returns `None` when the fleet rejects (503).
+    fn route_or_none(router: &Router, prompt: &str, headers: Option<&HeaderMap>) -> Option<String> {
+        router
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                Some(prompt),
+                None,
+                headers,
+                None,
+            )
+            .map(|w| w.url().to_string())
+    }
+
+    /// Build a HeaderMap with `X-Prompt-Tokens: <tokens>`.
+    fn tokens_header(tokens: usize) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-prompt-tokens",
+            http::HeaderValue::from_str(&tokens.to_string()).unwrap(),
+        );
+        h
+    }
+
+    /// Find a live worker by URL in the router's registry and pin its load.
+    fn pin_worker(router: &Router, url: &str, load: usize) {
+        let worker = router
+            .worker_registry
+            .get_all()
+            .iter()
+            .find(|w| w.url() == url)
+            .cloned()
+            .unwrap();
+        pin_load(&worker, load);
+    }
+
+    /// Mark a worker unhealthy by URL.
+    fn mark_unhealthy(router: &Router, url: &str) {
+        router
+            .worker_registry
+            .get_all()
+            .iter()
+            .find(|w| w.url() == url)
+            .cloned()
+            .unwrap()
+            .set_status(openai_protocol::worker::WorkerStatus::NotReady);
+    }
+
+    // --- Step 1: health filter ---
+
+    #[tokio::test]
+    async fn cal_step1_all_unhealthy_returns_503() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        mark_unhealthy(&router, &url_s);
+        mark_unhealthy(&router, &url_l);
+        let h = tokens_header(200_000);
+        let routed = route_or_none(&router, "hello", Some(&h));
+        assert!(
+            routed.is_none(),
+            "all unhealthy → 503 (None), got {routed:?}"
+        );
+    }
+
+    // --- Step 2: global imbalance ---
+
+    #[tokio::test]
+    async fn cal_step2_global_imbalance_picks_min_load() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        // Pin the long-pool worker high so the fleet is imbalanced (100 vs 0).
+        pin_worker(&router, &url_l, 100);
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_s, "imbalanced fleet → healthy min-load worker");
+    }
+
+    // --- Step 3: cache hit ---
+
+    #[tokio::test]
+    async fn cal_step3_cache_hit_sticks_regardless_of_pool() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let prompt = "shared long prompt prefix that builds cache affinity";
+
+        // Seed the cache with a long-request header so the first request goes
+        // to the long-pool worker (url_l), not the default short-pool routing.
+        let h = tokens_header(200_000);
+        let first = route_to_url(&router, prompt, Some(&h));
+        assert_eq!(first, url_l, "header-classified long request → long pool");
+
+        // Same prompt without the header: cache lookup (Step 3) takes
+        // precedence over pool selection (Step 4), so it stays on url_l.
+        let second = route_to_url(&router, prompt, None);
+        assert_eq!(second, url_l, "cache hit overrides short-pool routing");
+    }
+
+    #[tokio::test]
+    async fn cal_step3_no_tree_random_healthy_does_not_panic() {
+        // Do NOT call init_workers → no tree → random healthy fallback.
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = streaming_router(
+            cache_aware_length_policy(),
+            1024 * 1024,
+            vec![
+                labeled_worker(&url_s, None),
+                labeled_worker(&url_l, Some("long")),
+            ],
+        );
+        let routed = route_to_url(&router, "novel", None);
+        assert!(
+            routed == url_s || routed == url_l,
+            "random fallback picks a healthy worker: {routed}"
+        );
+    }
+
+    // --- Step 4 long request (uncached ≥ 100K): 4 paths ---
+
+    #[tokio::test]
+    async fn cal_step4_long_uses_long_pool_when_free() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_l, "long request, free long pool → long pool");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_long_overflows_to_idle_short() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        pin_worker(&router, &url_l, 2); // long pool full (load = max)
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_s, "full long pool → idle (load 0) short worker");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_long_queues_on_long_when_short_busy() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        pin_worker(&router, &url_l, 2); // long full
+        pin_worker(&router, &url_s, 1); // short busy (load > 0, not idle)
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_l, "long full + short busy → queue on long pool");
+    }
+
+    // Step 4: long pool全不健康 + 短池都 load>0 → 全部健康 worker min-load.
+    #[tokio::test]
+    async fn cal_step4_long_unhealthy_short_busy_all_healthy_min_load() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        mark_unhealthy(&router, &url_l); // long pool unhealthy
+        pin_worker(&router, &url_s, 1); // short busy (load > 0)
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(
+            routed, url_s,
+            "long unhealthy + short busy → all-healthy min-load (short worker)"
+        );
+    }
+
+    // --- Step 4 short request (uncached < 100K): 5 paths ---
+
+    #[tokio::test]
+    async fn cal_step4_short_uses_short_pool_when_free() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let h = tokens_header(1_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_s, "short request, free short pool → short pool");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_short_overflows_to_long_when_short_full() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        pin_worker(&router, &url_s, 2); // short pool full
+        let h = tokens_header(1_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_l, "short pool full → overflow to long pool");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_short_falls_back_to_short_when_both_full() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        pin_worker(&router, &url_s, 2); // short full
+        pin_worker(&router, &url_l, 2); // long full
+        let h = tokens_header(1_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_s, "both full → queue on short pool min-load");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_short_uses_long_when_short_pool_empty() {
+        // Only long-pool workers configured; short pool is empty.
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[], &[&url_l]).await;
+        let h = tokens_header(1_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_l, "no short pool → long pool min-load");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_short_both_pools_empty_all_healthy_min_load() {
+        // Only one healthy short worker (long pool empty); it is the sole
+        // all-healthy min-load candidate.
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[]).await;
+        let h = tokens_header(1_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(
+            routed, url_s,
+            "single healthy worker → all-healthy min-load"
+        );
+    }
+
+    // --- Step 4: token source priority (header vs char estimate vs none) ---
+
+    #[tokio::test]
+    async fn cal_step4_char_estimate_fallback_when_no_header() {
+        // No X-Prompt-Tokens header → char-level estimate. A 400-char novel
+        // prompt → 100 tokens < 100K threshold → short request → short pool.
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let prompt = "a".repeat(400);
+        let routed = route_to_url(&router, &prompt, None);
+        assert_eq!(routed, url_s, "char estimate < threshold → short pool");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_uncached_unknown_all_healthy_min_load() {
+        // Empty prompt, no header, no tokens → uncached not computable →
+        // all-healthy min-load. Pin the long worker higher so the short worker
+        // is the unique minimum-load candidate.
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        pin_worker(&router, &url_l, 10); // long worker at load 10
+        let routed = route_to_url(&router, "", None);
+        assert_eq!(
+            routed, url_s,
+            "uncached unknown → all-healthy min-load (short worker at load 0)"
+        );
+    }
+
+    // --- Step 5: tree recording (cache hit after pool routing) ---
+
+    #[tokio::test]
+    async fn cal_step5_pool_routing_records_tree_for_future_hit() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let prompt = "novel pool-routed prompt that will be recorded";
+        // First request: novel → pool split (short, since <100K by char estimate)
+        let first = route_to_url(&router, prompt, None);
+        // Second request: same prompt → now a cache hit → same worker.
+        let second = route_to_url(&router, prompt, None);
+        assert_eq!(first, second, "pool routing recorded tree → subsequent hit");
+    }
+
+    // --- 补充场景 ---
+
+    // Step 3: 命中但命中的 worker 不健康 → 清理 stale + 回退第一个健康 worker
+    #[tokio::test]
+    async fn cal_step3_hit_unhealthy_falls_back_to_first_healthy() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let prompt = "shared cache-building prompt for affinity test";
+        // 第一次：建立缓存
+        let first = route_to_url(&router, prompt, None);
+        // 标记被选中的 worker 不健康
+        mark_unhealthy(&router, &first);
+        // 第二次：相同 prompt 命中，但 worker 不健康 → 回退到另一个健康 worker
+        let second = route_to_url(&router, prompt, None);
+        assert_ne!(
+            second, first,
+            "unhealthy matched worker must not be selected"
+        );
+    }
+
+    // Step 4 ≥100K: 长池全不健康 + 短池有 load=0 worker → 长→短溢出到 idle worker
+    #[tokio::test]
+    async fn cal_step4_long_pool_unhealthy_overflows_to_idle_short() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        mark_unhealthy(&router, &url_l); // 长池全不健康
+                                         // 短池 worker idle (load 0)
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_s, "long pool all unhealthy → idle short worker");
+    }
+
+    // Step 4 token 源优先级：header 精确值覆盖字符级估算
+    #[tokio::test]
+    async fn cal_step4_header_overrides_char_estimate() {
+        // 短 prompt（字符估算 → 1 token → 短请求 → 短池），
+        // 但 header 传 200000（→ 长请求 → 长池）。
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "short", Some(&h));
+        assert_eq!(
+            routed, url_l,
+            "header (200K) must override char estimate (1 token) → long pool"
+        );
     }
 }

@@ -12,8 +12,8 @@ use smg::{
     routers::RouterTrait,
     server::{build_app, AppState},
     worker::{
-        BasicWorkerBuilder, ModelCard, OverloadThresholds, RuntimeType, Worker, WorkerMonitor,
-        WorkerRegistry, WorkerType,
+        BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
+        WorkerType,
     },
 };
 use smg_data_connector::{
@@ -38,7 +38,7 @@ pub fn create_test_app(
             let rate_limit_tokens = router_config
                 .rate_limit_tokens_per_second
                 .filter(|&t| t > 0)
-                .unwrap_or(n);
+                .unwrap_or(0);
             Some(Arc::new(TokenBucket::new(
                 n as usize,
                 rate_limit_tokens as usize,
@@ -64,7 +64,7 @@ pub fn create_test_app(
         client.clone(),
         router_config.load_monitor_interval_secs,
         router_config.engine_metrics,
-        OverloadThresholds::default(),
+        router_config.disable_load_monitoring,
     )));
 
     // Create empty OnceLock for worker job queue and workflow engines

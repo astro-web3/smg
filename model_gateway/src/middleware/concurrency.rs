@@ -17,7 +17,7 @@ use std::{
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::StatusCode,
+    http::{header::RETRY_AFTER, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -29,11 +29,21 @@ use tokio::{
 };
 use tracing::{debug, error, warn};
 
-use super::token_bucket::TokenBucket;
+use super::{token_bucket::TokenBucket, SHED_RETRY_AFTER_SECS};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
+    routers::error::create_error,
     server::AppState,
 };
+
+/// Standard error body plus `Retry-After` for admission sheds.
+fn shed_response(status: StatusCode, code: &'static str, message: &'static str) -> Response {
+    let mut response = create_error(status, code, message);
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from(SHED_RETRY_AFTER_SECS));
+    response
+}
 
 /// Returns an acquired token when the request is cancelled or the response body is dropped.
 struct TokenPermit {
@@ -176,7 +186,7 @@ impl QueueProcessor {
             let elapsed = queued.queued_at.elapsed();
             if elapsed >= self.queue_timeout {
                 warn!("Request already timed out in queue");
-                let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
+                let _ = queued.permit_tx.send(Err(StatusCode::SERVICE_UNAVAILABLE));
                 continue;
             }
 
@@ -204,7 +214,7 @@ impl QueueProcessor {
                         let _ = queued.permit_tx.send(Ok(permit));
                     } else {
                         warn!("Queue: request timed out waiting for token");
-                        let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
+                        let _ = queued.permit_tx.send(Err(StatusCode::SERVICE_UNAVAILABLE));
                     }
                 });
             }
@@ -301,7 +311,11 @@ pub async fn concurrency_limit_middleware(
                             Metrics::record_admission_rejected(
                                 metrics_labels::ADMISSION_REJECTED_TIMEOUT,
                             );
-                            status.into_response()
+                            shed_response(
+                                status,
+                                "admission_queue_timeout",
+                                "timed out waiting for an admission slot",
+                            )
                         }
                         Err(_) => {
                             error!("Queue response channel closed");
@@ -314,13 +328,21 @@ pub async fn concurrency_limit_middleware(
                     warn!("Request queue is full, returning 429");
                     Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                     Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_FULL);
-                    StatusCode::TOO_MANY_REQUESTS.into_response()
+                    shed_response(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "admission_queue_full",
+                        "admission queue is at capacity",
+                    )
                 }
             }
         } else {
             warn!("No tokens available and queuing is disabled, returning 429");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-            StatusCode::TOO_MANY_REQUESTS.into_response()
+            shed_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "admission_queue_full",
+                "concurrency limit reached and queuing is disabled",
+            )
         }
     }
 }
@@ -333,12 +355,14 @@ mod tests {
     };
 
     use axum::{routing::post, Router};
+    use http_body_util::BodyExt;
     use llm_tokenizer::registry::TokenizerRegistry;
     use metrics_exporter_prometheus::PrometheusBuilder;
     use smg_data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     };
     use tokio::sync::Notify;
+    use tokio_stream::wrappers::ReceiverStream;
     use tower::ServiceExt;
 
     use super::*;
@@ -403,6 +427,42 @@ mod tests {
             .unwrap()
     }
 
+    /// App with a one-shot channel-fed streaming route plus `/echo`,
+    /// queueing disabled.
+    fn stream_app(
+        bucket: Arc<TokenBucket>,
+    ) -> (
+        Router,
+        mpsc::Sender<Result<Bytes, std::convert::Infallible>>,
+    ) {
+        let (frame_tx, frame_rx) = mpsc::channel(4);
+        let frame_rx = Arc::new(std::sync::Mutex::new(Some(frame_rx)));
+        let stream = move || {
+            let rx = frame_rx
+                .lock()
+                .unwrap()
+                .take()
+                .expect("stream route is one-shot");
+            async move { Body::from_stream(ReceiverStream::new(rx)) }
+        };
+        let app = Router::new()
+            .route("/stream", post(stream))
+            .route("/echo", post(|body: Bytes| async move { body }))
+            .layer(axum::middleware::from_fn_with_state(
+                test_app_state(bucket, None),
+                concurrency_limit_middleware,
+            ));
+        (app, frame_tx)
+    }
+
+    fn stream_request() -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/stream")
+            .body(Body::empty())
+            .unwrap()
+    }
+
     fn assert_metric_line(rendered: &str, series: &str, value: &str) {
         let expected = format!("{series} {value}");
         assert!(
@@ -441,6 +501,110 @@ mod tests {
         assert_eq!(bucket.available_tokens(), 0.0);
         drop(body);
         assert_eq!(bucket.available_tokens(), 1.0);
+    }
+
+    /// A streaming response keeps its token after the handler returns: a
+    /// request beyond the cap sheds until the stream is consumed and dropped.
+    #[tokio::test]
+    async fn streaming_response_holds_token_until_stream_consumed() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let (app, frame_tx) = stream_app(bucket.clone());
+
+        let response = app.clone().oneshot(stream_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let shed = app
+            .clone()
+            .oneshot(echo_request(Body::from("x")))
+            .await
+            .unwrap();
+        assert_eq!(shed.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            shed.headers().get(RETRY_AFTER).unwrap(),
+            &HeaderValue::from(SHED_RETRY_AFTER_SECS)
+        );
+
+        frame_tx
+            .send(Ok(Bytes::from_static(b"chunk")))
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"chunk"));
+
+        let shed = app
+            .clone()
+            .oneshot(echo_request(Body::from("x")))
+            .await
+            .unwrap();
+        assert_eq!(
+            shed.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "token must stay held mid-stream"
+        );
+
+        drop(frame_tx);
+        assert!(body.frame().await.is_none());
+        drop(body);
+        assert_eq!(bucket.available_tokens(), 1.0);
+
+        let admitted = app.oneshot(echo_request(Body::from("x"))).await.unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
+    }
+
+    /// Dropping the response mid-stream (client disconnect) returns the token.
+    #[tokio::test]
+    async fn client_disconnect_mid_stream_returns_token() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let (app, frame_tx) = stream_app(bucket.clone());
+
+        let response = app.clone().oneshot(stream_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        frame_tx
+            .send(Ok(Bytes::from_static(b"first")))
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+        body.frame().await.unwrap().unwrap();
+
+        assert_eq!(bucket.available_tokens(), 0.0);
+        drop(body);
+        assert_eq!(bucket.available_tokens(), 1.0);
+
+        let admitted = app.oneshot(echo_request(Body::from("x"))).await.unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
+    }
+
+    /// A buffered response also spans the write: the token frees only once
+    /// the body has been consumed.
+    #[tokio::test]
+    async fn buffered_response_holds_token_until_body_consumed() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let app = echo_app(test_app_state(bucket.clone(), None));
+
+        let response = app
+            .clone()
+            .oneshot(echo_request(Body::from("payload")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let shed = app
+            .clone()
+            .oneshot(echo_request(Body::from("x")))
+            .await
+            .unwrap();
+        assert_eq!(shed.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let echoed = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&echoed[..], b"payload");
+        assert_eq!(bucket.available_tokens(), 1.0);
+
+        let admitted = app.oneshot(echo_request(Body::from("x"))).await.unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -601,6 +765,15 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(
+                    rejected.headers().get(RETRY_AFTER).unwrap(),
+                    &HeaderValue::from(SHED_RETRY_AFTER_SECS)
+                );
+                let body = axum::body::to_bytes(rejected.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["error"]["code"], "admission_queue_full");
 
                 let rendered = handle.render();
                 assert_metric_line(&rendered, "smg_admission_queue_depth", "1");
@@ -618,8 +791,8 @@ mod tests {
         });
     }
 
-    /// A request that outlives the queue timeout is rejected with
-    /// reason="timeout" and releases its queue-depth slot.
+    /// A request that outlives the queue timeout sheds as 503 + Retry-After
+    /// with reason="timeout" and releases its queue-depth slot.
     #[test]
     #[expect(
         clippy::disallowed_methods,
@@ -643,7 +816,16 @@ mod tests {
 
                 let held = TokenPermit::try_acquire(bucket, 1.0).unwrap();
                 let response = app.oneshot(echo_request(Body::from("late"))).await.unwrap();
-                assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    response.headers().get(RETRY_AFTER).unwrap(),
+                    &HeaderValue::from(SHED_RETRY_AFTER_SECS)
+                );
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["error"]["code"], "admission_queue_timeout");
                 drop(held);
             });
         });

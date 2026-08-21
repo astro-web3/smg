@@ -93,6 +93,20 @@ pub struct RouterConfig {
     pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// Restore the conditional load-monitor poll gate: only poll worker groups
+    /// when a load-aware routing policy, `engine_metrics`, or overload
+    /// protection needs the data. Default `false` — the monitor polls every
+    /// group unconditionally from registration onward. A load-aware policy is
+    /// always fed regardless of this flag.
+    #[serde(default)]
+    pub disable_load_monitoring: bool,
+    /// Enable absolute worker overload protection with the gateway default of
+    /// `worker_overload_token_usage = 0.9` (KV token usage is engine-universal;
+    /// a waiting-requests default would be workload-dependent, so that signal
+    /// stays unset). Redundant when either explicit threshold below is set —
+    /// those enable protection on their own, exactly as before this flag.
+    #[serde(default)]
+    pub worker_overload_protection: bool,
     /// Queued-request count at or above which a worker is considered
     /// overloaded and excluded from routing until the signal recovers; when all
     /// workers are overloaded, requests are shed immediately rather than
@@ -153,11 +167,13 @@ pub struct RouterConfig {
     pub storage_context_headers: HashMap<String, String>,
     #[serde(default)]
     pub tenant_resolution: TenantResolutionConfig,
-    /// Set to -1 to disable rate limiting
+    /// Standing-concurrency cap; -1 disables. Each admission permit is
+    /// held for the full response, including streaming bodies.
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
     pub queue_timeout_secs: u64,
-    /// If not set, defaults to max_concurrent_requests
+    /// Unset or 0 = no refill: `max_concurrent_requests` bounds standing
+    /// concurrency alone.
     pub rate_limit_tokens_per_second: Option<i32>,
     /// Enable the priority-aware admission scheduler. When false (default),
     /// the legacy concurrency-limit middleware stays wired — zero behavior
@@ -243,10 +259,11 @@ pub struct RouterConfig {
     /// PEM format, loaded from ca_cert_paths during config creation
     #[serde(default)]
     pub ca_certificates: Vec<Vec<u8>>,
-    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),
-    /// multiplexing every request to a worker over one connection instead of
-    /// one TCP connection per in-flight request. Requires every HTTP worker
-    /// to serve HTTP/2 without an upgrade handshake.
+    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
+    /// engine-directed connections — request dispatch and health/probe traffic
+    /// alike — multiplexing every request to a worker over one connection
+    /// instead of one TCP connection per in-flight request. Requires every
+    /// HTTP worker to serve HTTP/2 without an upgrade handshake.
     #[serde(default)]
     pub upstream_http2: bool,
     /// Loaded from mcp_config_path during config creation
@@ -627,6 +644,45 @@ pub enum PolicyConfig {
         cache_boundaries: Vec<usize>,
     },
 
+    /// Cache-aware length policy: cache affinity with a long/short pool split
+    /// driven by the `pool` worker label (`pool=long` → long pool, otherwise
+    /// short pool). Step 1-3 mirror `cache_aware` (string tree only); step 4
+    /// routes by uncached prefill tokens. See `policies/cache_aware_length.rs`.
+    #[serde(rename = "cache_aware_length")]
+    CacheAwareLength {
+        /// Minimum matched-prefix share before a request pins to a holder.
+        #[serde(alias = "cache_match_threshold")]
+        #[serde(default = "default_cal_cache_threshold")]
+        cache_threshold: f32,
+        /// Spill gate, absolute part: the global imbalance fires when the
+        /// healthy-fleet load spread exceeds this.
+        #[serde(alias = "spill_abs_threshold")]
+        #[serde(default = "default_cal_balance_abs_threshold")]
+        balance_abs_threshold: usize,
+        /// Spill gate, relative part (multiple of the healthy-fleet min load);
+        /// fires only together with `balance_abs_threshold`.
+        #[serde(alias = "spill_rel_threshold")]
+        #[serde(default = "default_cal_balance_rel_threshold")]
+        balance_rel_threshold: f32,
+        #[serde(default = "default_cal_eviction_interval_secs")]
+        eviction_interval_secs: u64,
+        #[serde(default = "default_cal_max_tree_size")]
+        max_tree_size: usize,
+        /// Divisor for char-level token estimation when `X-Prompt-Tokens` is
+        /// absent (default 4).
+        #[serde(default = "default_cal_chars_per_token")]
+        chars_per_token: usize,
+        /// Uncached-prefill-token boundary between long and short requests.
+        #[serde(default = "default_cal_long_prefill_threshold")]
+        long_prefill_threshold: usize,
+        /// Load ceiling for the long pool (`pool=long` workers).
+        #[serde(default = "default_cal_long_pool_max_load")]
+        long_pool_max_load: usize,
+        /// Load ceiling for the short pool (remaining workers).
+        #[serde(default = "default_cal_short_pool_max_load")]
+        short_pool_max_load: usize,
+    },
+
     /// Power-of-two choices policy: samples two workers and routes to the one
     /// with the lower expected wait, scored like `least_load`
     /// (`(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`).
@@ -760,6 +816,35 @@ fn default_cache_ttl_secs() -> u64 {
     180
 }
 
+// cache_aware_length defaults (kept aligned with CacheAwareLengthConfig::default).
+fn default_cal_cache_threshold() -> f32 {
+    0.3
+}
+fn default_cal_balance_abs_threshold() -> usize {
+    32
+}
+fn default_cal_balance_rel_threshold() -> f32 {
+    1.1
+}
+fn default_cal_eviction_interval_secs() -> u64 {
+    30
+}
+fn default_cal_max_tree_size() -> usize {
+    10000
+}
+fn default_cal_chars_per_token() -> usize {
+    4
+}
+fn default_cal_long_prefill_threshold() -> usize {
+    100_000
+}
+fn default_cal_long_pool_max_load() -> usize {
+    4
+}
+fn default_cal_short_pool_max_load() -> usize {
+    32
+}
+
 fn default_prefix_token_count() -> usize {
     256
 }
@@ -811,6 +896,7 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::Passthrough => "passthrough",
             PolicyConfig::CacheAware { .. } => "cache_aware",
+            PolicyConfig::CacheAwareLength { .. } => "cache_aware_length",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::LeastLoad { .. } => "least_load",
             PolicyConfig::Bucket { .. } => "bucket",
@@ -1039,6 +1125,8 @@ impl Default for RouterConfig {
             job_queue_capacity: default_job_queue_capacity(),
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            disable_load_monitoring: false,
+            worker_overload_protection: false,
             worker_overload_waiting_requests: None,
             worker_overload_token_usage: None,
             kv_indexer_ttl_secs: None,

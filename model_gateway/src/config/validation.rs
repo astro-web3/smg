@@ -565,6 +565,81 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::CacheAwareLength {
+                cache_threshold,
+                balance_abs_threshold: _,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
+                chars_per_token,
+                long_prefill_threshold,
+                long_pool_max_load,
+                short_pool_max_load,
+            } => {
+                if !(0.0..=1.0).contains(cache_threshold) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache_threshold".to_string(),
+                        value: cache_threshold.to_string(),
+                        reason: "Must be between 0.0 and 1.0".to_string(),
+                    });
+                }
+
+                if *balance_rel_threshold < 1.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "balance_rel_threshold".to_string(),
+                        value: balance_rel_threshold.to_string(),
+                        reason: "Must be >= 1.0".to_string(),
+                    });
+                }
+
+                if *eviction_interval_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "eviction_interval_secs".to_string(),
+                        value: eviction_interval_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *max_tree_size == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "max_tree_size".to_string(),
+                        value: max_tree_size.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *chars_per_token == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "chars_per_token".to_string(),
+                        value: chars_per_token.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *long_prefill_threshold == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "long_prefill_threshold".to_string(),
+                        value: long_prefill_threshold.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *long_pool_max_load == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "long_pool_max_load".to_string(),
+                        value: long_pool_max_load.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *short_pool_max_load == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "short_pool_max_load".to_string(),
+                        value: short_pool_max_load.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
             } => {

@@ -230,7 +230,7 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "cache_aware_length", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Minimum matched-prefix share (0.0-1.0) before cache-aware routing
@@ -277,6 +277,24 @@ struct CliArgs {
     /// regardless of spread. Best set high (e.g. 0.9). >= 1.0 disables it.
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
+
+    /// Enable worker overload protection with the gateway default thresholds.
+    ///
+    /// A worker whose load signal crosses a threshold is considered overloaded
+    /// and excluded from routing until the signal recovers; when every worker
+    /// is overloaded, requests are shed immediately rather than queued.
+    ///
+    /// This flag alone applies --worker-overload-token-usage 0.9 and leaves
+    /// --worker-overload-waiting-requests unset: KV token usage means the same
+    /// thing on every engine, while a sensible waiting-requests ceiling is
+    /// workload-dependent, so it has no universal default. Explicit thresholds
+    /// override the default, and either threshold set on its own enables
+    /// protection without this flag — exactly as before it existed. Per-worker
+    /// `overload` blocks on a WorkerSpec override the gateway values per
+    /// signal, and enable protection for that worker even with everything here
+    /// unset.
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    worker_overload_protection: bool,
 
     /// Queued-request count at or above which a worker is considered
     /// overloaded and excluded from routing until the signal recovers; when
@@ -350,6 +368,27 @@ struct CliArgs {
     /// approximate serving-engine cache retention
     #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Routing Policy")]
     cache_ttl_secs: u64,
+
+    // ---- cache_aware_length policy ----
+    /// Divisor for char-level token estimation when X-Prompt-Tokens is absent
+    /// (cache_aware_length policy). Default 4.
+    #[arg(long, default_value_t = 4, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    chars_per_token: usize,
+
+    /// Uncached-prefill-token boundary between long and short requests
+    /// (cache_aware_length policy). Default 100000.
+    #[arg(long, default_value_t = 100_000, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    long_prefill_threshold: usize,
+
+    /// Load ceiling for the long pool (pool=long workers) in the
+    /// cache_aware_length policy. Default 4.
+    #[arg(long, default_value_t = 4, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    long_pool_max_load: usize,
+
+    /// Load ceiling for the short pool (remaining workers) in the
+    /// cache_aware_length policy. Default 32.
+    #[arg(long, default_value_t = 32, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    short_pool_max_load: usize,
 
     /// How long an unused sticky routing key stays pinned: keys idle beyond
     /// this many seconds are evicted from the manual-policy / sticky-session
@@ -452,11 +491,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "cache_aware_length", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "cache_aware_length", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
     /// Specific policy for encode nodes in EPD mode. Defaults to consistent_hashing.
@@ -490,15 +529,24 @@ struct CliArgs {
     #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
 
-    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),
-    /// multiplexing every request to a worker over one connection. Requires
-    /// every HTTP worker to serve HTTP/2 without an upgrade handshake.
+    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
+    /// engine-directed connections — request dispatch and health/probe traffic
+    /// alike — multiplexing every request to a worker over one connection.
+    /// Requires every HTTP worker to serve HTTP/2 without an upgrade handshake.
     #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
     upstream_http2: bool,
 
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
+
+    /// Only poll worker loads when a load-aware routing policy,
+    /// --engine-metrics, or worker overload protection needs the data. By
+    /// default every worker group is polled from registration onward; this
+    /// restores the old conditional gate (a load-aware policy is always fed
+    /// regardless).
+    #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
+    disable_load_monitoring: bool,
 
     /// Re-export engine GetLoads signals (incl. PD) as smg_engine_* Prometheus
     /// gauges, polling even without a load-aware routing policy.
@@ -677,7 +725,8 @@ struct CliArgs {
     cors_allowed_origins: Vec<String>,
 
     // ==================== Rate Limiting ====================
-    /// Maximum concurrent requests (-1 to disable)
+    /// Maximum standing concurrent requests (-1 to disable). Each admission
+    /// permit is held for the full response, including streaming bodies.
     #[arg(long, default_value_t = -1, help_heading = "Rate Limiting")]
     max_concurrent_requests: i32,
 
@@ -719,7 +768,8 @@ struct CliArgs {
     #[arg(long, help_heading = "Tenant Rate Limit")]
     tenant_rate_limit_config: Option<String>,
 
-    /// Token bucket refill rate (tokens per second)
+    /// Token bucket refill rate (tokens per second). Unset or 0 = no refill:
+    /// --max-concurrent-requests bounds standing concurrency alone.
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
 
@@ -1353,6 +1403,17 @@ impl CliArgs {
                 cache_ttl_secs: self.cache_ttl_secs,
                 cache_boundaries: self.cache_boundaries.clone(),
             },
+            "cache_aware_length" => PolicyConfig::CacheAwareLength {
+                cache_threshold: self.cache_threshold,
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
+                eviction_interval_secs: self.eviction_interval,
+                max_tree_size: self.max_tree_size,
+                chars_per_token: self.chars_per_token,
+                long_prefill_threshold: self.long_prefill_threshold,
+                long_pool_max_load: self.long_pool_max_load,
+                short_pool_max_load: self.short_pool_max_load,
+            },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
             },
@@ -1755,6 +1816,8 @@ impl CliArgs {
             .job_queue_capacity(self.job_queue_capacity)
             .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .disable_load_monitoring(self.disable_load_monitoring)
+            .worker_overload_protection(self.worker_overload_protection)
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
             .worker_overload_token_usage(self.worker_overload_token_usage)
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
@@ -2422,6 +2485,53 @@ mod tests {
         // The inclusive ends of the accepted ranges must still parse.
         assert!(Cli::try_parse_from(["smg", "--worker-overload-waiting-requests", "1"]).is_ok());
         assert!(Cli::try_parse_from(["smg", "--worker-overload-token-usage", "1.0"]).is_ok());
+    }
+
+    /// `--worker-overload-protection` and `--disable-load-monitoring` must
+    /// reach `RouterConfig` and survive nesting into
+    /// `ServerConfig.router_config`. Two-path config-plumbing guard.
+    #[test]
+    fn overload_protection_and_monitoring_flags_flow_into_both_configs() {
+        let cli = cli_args_from(&["--worker-overload-protection", "--disable-load-monitoring"]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            router_config.worker_overload_protection,
+            "worker_overload_protection must reach RouterConfig via to_router_config"
+        );
+        assert!(
+            router_config.disable_load_monitoring,
+            "disable_load_monitoring must reach RouterConfig via to_router_config"
+        );
+        // The flag alone carries no thresholds; the token default is applied
+        // at resolution, not stored in config.
+        assert_eq!(router_config.worker_overload_waiting_requests, None);
+        assert_eq!(router_config.worker_overload_token_usage, None);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(
+            server_config.router_config.worker_overload_protection,
+            "worker_overload_protection must survive into ServerConfig"
+        );
+        assert!(
+            server_config.router_config.disable_load_monitoring,
+            "disable_load_monitoring must survive into ServerConfig"
+        );
+    }
+
+    /// Defaults: protection off, monitoring default-on (opt-out false) — the
+    /// behavior change is monitoring, and it is carried by the default here.
+    #[test]
+    fn overload_protection_and_monitoring_flags_default_off_in_both_configs() {
+        let cli = cli_args_from(&[]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(!router_config.worker_overload_protection);
+        assert!(!router_config.disable_load_monitoring);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(!server_config.router_config.worker_overload_protection);
+        assert!(!server_config.router_config.disable_load_monitoring);
     }
 
     /// Cache-index flags must reach the cache_aware policy variant and the

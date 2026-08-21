@@ -31,8 +31,8 @@ use smg::{
     policies::PolicyRegistry,
     routers::{router_manager::RouterManager, RouterFactory, RouterTrait},
     worker::{
-        BasicWorkerBuilder, ModelCard, OverloadThresholds, RuntimeType, Worker, WorkerMonitor,
-        WorkerRegistry, WorkerType,
+        BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
+        WorkerType,
     },
     workflow::Job,
 };
@@ -338,7 +338,7 @@ async fn build_test_app_context(
             let rate_limit_tokens = config
                 .rate_limit_tokens_per_second
                 .filter(|&t| t > 0)
-                .unwrap_or(n);
+                .unwrap_or(0);
             Some(Arc::new(TokenBucket::new(
                 n as usize,
                 rate_limit_tokens as usize,
@@ -362,7 +362,7 @@ async fn build_test_app_context(
         client.clone(),
         config.load_monitor_interval_secs,
         config.engine_metrics,
-        OverloadThresholds::default(),
+        config.disable_load_monitoring,
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
