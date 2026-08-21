@@ -115,6 +115,7 @@ jobs:
           file: docker/Dockerfile
           push: false
           load: false
+          platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=min
 
@@ -129,6 +130,7 @@ jobs:
           file: docker/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/amd64
           cache-from: type=gha
 
       - name: Retry push (attempt 2)
@@ -147,6 +149,7 @@ jobs:
           file: docker/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/amd64
           cache-from: type=gha
 
       - name: Retry push (attempt 3)
@@ -165,6 +168,7 @@ jobs:
           file: docker/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/amd64
           cache-from: type=gha
 
       # 三次推送任一成功即通过；全败则标红并阻断 job。
