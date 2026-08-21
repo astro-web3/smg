@@ -3024,11 +3024,12 @@ mod tests {
     // pre-set loads use WorkerLoadGuard + mem::forget (same as the unit tests).
 
     /// Pin a worker's in-flight load at `load` for the lifetime of the test by
-    /// leaking the RAII guard (the process tears down on test exit).
-    fn pin_load(worker: &crate::worker::BasicWorker, load: usize) {
-        let w: Arc<dyn Worker> = Arc::new(worker.clone());
+    /// leaking the RAII guard (the process tears down on test exit). Accepts
+    /// the registered `Arc<dyn Worker>` directly — no downcast needed since
+    /// `WorkerLoadGuard::new` takes `Arc<dyn Worker>`.
+    fn pin_load(worker: &Arc<dyn Worker>, load: usize) {
         for _ in 0..load {
-            std::mem::forget(WorkerLoadGuard::new(Arc::clone(&w), None));
+            std::mem::forget(WorkerLoadGuard::new(Arc::clone(worker), None));
         }
     }
 
@@ -3098,19 +3099,14 @@ mod tests {
 
     /// Find a live worker by URL in the router's registry and pin its load.
     fn pin_worker(router: &Router, url: &str, load: usize) {
-        pin_load(
-            router
-                .worker_registry
-                .get_all()
-                .iter()
-                .find(|w| w.url() == url)
-                .cloned()
-                .unwrap()
-                .as_any()
-                .downcast_ref::<crate::worker::BasicWorker>()
-                .unwrap(),
-            load,
-        );
+        let worker = router
+            .worker_registry
+            .get_all()
+            .iter()
+            .find(|w| w.url() == url)
+            .cloned()
+            .unwrap();
+        pin_load(&worker, load);
     }
 
     /// Mark a worker unhealthy by URL.
@@ -3164,9 +3160,17 @@ mod tests {
         let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
         let router = length_router(&[&url_s], &[&url_l]).await;
         let prompt = "shared long prompt prefix that builds cache affinity";
-        let first = route_to_url(&router, prompt, None);
+
+        // Seed the cache with a long-request header so the first request goes
+        // to the long-pool worker (url_l), not the default short-pool routing.
+        let h = tokens_header(200_000);
+        let first = route_to_url(&router, prompt, Some(&h));
+        assert_eq!(first, url_l, "header-classified long request → long pool");
+
+        // Same prompt without the header: cache lookup (Step 3) takes
+        // precedence over pool selection (Step 4), so it stays on url_l.
         let second = route_to_url(&router, prompt, None);
-        assert_eq!(first, second, "cache hit pins to the same worker");
+        assert_eq!(second, url_l, "cache hit overrides short-pool routing");
     }
 
     #[tokio::test]
@@ -3315,15 +3319,17 @@ mod tests {
 
     #[tokio::test]
     async fn cal_step4_uncached_unknown_all_healthy_min_load() {
-        // Empty prompt, no header → uncached not computable → all-healthy
-        // min-load (the first healthy worker, i.e. the short worker).
+        // Empty prompt, no header, no tokens → uncached not computable →
+        // all-healthy min-load. Pin the long worker higher so the short worker
+        // is the unique minimum-load candidate.
         let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
         let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
         let router = length_router(&[&url_s], &[&url_l]).await;
+        pin_worker(&router, &url_l, 10); // long worker at load 10
         let routed = route_to_url(&router, "", None);
-        assert!(
-            routed == url_s || routed == url_l,
-            "uncached unknown → all-healthy min-load: {routed}"
+        assert_eq!(
+            routed, url_s,
+            "uncached unknown → all-healthy min-load (short worker at load 0)"
         );
     }
 

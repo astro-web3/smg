@@ -372,22 +372,22 @@ struct CliArgs {
     // ---- cache_aware_length policy ----
     /// Divisor for char-level token estimation when X-Prompt-Tokens is absent
     /// (cache_aware_length policy). Default 4.
-    #[arg(long, default_value_t = 4, help_heading = "Routing Policy")]
+    #[arg(long, default_value_t = 4, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
     chars_per_token: usize,
 
     /// Uncached-prefill-token boundary between long and short requests
     /// (cache_aware_length policy). Default 100000.
-    #[arg(long, default_value_t = 100_000, help_heading = "Routing Policy")]
+    #[arg(long, default_value_t = 100_000, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
     long_prefill_threshold: usize,
 
     /// Load ceiling for the long pool (pool=long workers) in the
     /// cache_aware_length policy. Default 4.
-    #[arg(long, default_value_t = 4, help_heading = "Routing Policy")]
+    #[arg(long, default_value_t = 4, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
     long_pool_max_load: usize,
 
     /// Load ceiling for the short pool (remaining workers) in the
     /// cache_aware_length policy. Default 32.
-    #[arg(long, default_value_t = 32, help_heading = "Routing Policy")]
+    #[arg(long, default_value_t = 32, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
     short_pool_max_load: usize,
 
     /// How long an unused sticky routing key stays pinned: keys idle beyond
