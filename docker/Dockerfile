@@ -181,7 +181,10 @@ COPY --from=local_src /src /opt/smg
 WORKDIR /opt/smg
 
 # Build the actual wheel. `cargo clean` removed — it defeated layer caching.
-RUN rm -rf bindings/python/dist/ \
+# `uv pip install maturin` is here (not only in the pre-build layer) so the
+# build step is self-contained even when the pre-build layer is cached.
+RUN uv pip install maturin \
+    && rm -rf bindings/python/dist/ \
     && cd bindings/python \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl,opencv-video --out dist \
     && rm -rf /root/.cache
