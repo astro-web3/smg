@@ -801,10 +801,11 @@ mod tests {
     #[test]
     fn step4_no_long_pool_workers_routes_to_short_pool() {
         let policy = CacheAwareLengthPolicy::with_config(test_config());
-        // Both workers are short pool (no "long" label).
+        // Both workers are short pool (no "long" label). Pin w2 higher so
+        // w1 is the unique minimum-load worker.
         let workers: Vec<Arc<dyn Worker>> = vec![
             make_worker("http://w1:8000", None, 0),
-            make_worker("http://w2:8000", None, 0),
+            make_worker("http://w2:8000", None, 1),
         ];
         policy.init_workers(&workers);
         let headers = tokens_headers(200_000);
@@ -812,9 +813,10 @@ mod tests {
         let idx = policy.select_worker(&workers, &info).unwrap();
         // long_indices empty → all workers are short pool.
         // ≥100K → select_long_request → long_pool empty → short pool min-load.
-        assert!(
-            idx < workers.len(),
-            "long pool empty → short pool min-load"
+        assert_eq!(
+            workers[idx].url(),
+            "http://w1:8000",
+            "long pool empty → short pool min-load (idle worker)"
         );
     }
 }
