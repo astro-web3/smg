@@ -45,11 +45,9 @@
 
 use std::sync::Arc;
 
-use tracing::debug;
-
 use super::{
-    normalize_model_key, CacheAwareConfig, CacheAwareLengthConfig, CacheAwarePolicy,
-    LoadBalancingPolicy, NoCacheStrategy, SelectWorkerInfo, UncachedHint,
+    CacheAwareLengthConfig, CacheAwarePolicy, LoadBalancingPolicy, NoCacheStrategy,
+    SelectWorkerInfo, UncachedHint,
 };
 use crate::{
     mesh::adapters::tree_sync::TreeSyncAdapter,
@@ -72,7 +70,7 @@ const HEADER_PROMPT_TOKENS: &str = "x-prompt-tokens";
 #[derive(Debug)]
 pub struct CacheAwareLengthPolicy {
     inner: CacheAwarePolicy,
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     config: CacheAwareLengthConfig,
 }
 
@@ -355,7 +353,7 @@ fn pool_min_load_worker(pool: &[(usize, usize, usize)]) -> Option<usize> {
 }
 
 /// Parse the `X-Prompt-Tokens` header into a token count. Returns `None` on
-/// missing/unparseable values.
+/// missing/unparsable values.
 fn parse_prompt_tokens_header(headers: Option<&http::HeaderMap>) -> Option<usize> {
     let headers = headers?;
     headers
@@ -372,6 +370,7 @@ mod tests {
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
 
     use super::*;
+    use crate::policies::CacheAwareConfig;
     use crate::worker::{BasicWorkerBuilder, WorkerType};
 
     fn no_health_check() -> HealthCheckConfig {

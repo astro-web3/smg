@@ -511,17 +511,17 @@ impl ConfigValidator {
                 cache_boundaries,
             } => {
                 Self::validate_cache_aware_shared(
-                    cache_threshold,
-                    balance_rel_threshold,
-                    eviction_interval_secs,
-                    max_tree_size,
-                    block_size,
-                    balance_token_usage_threshold,
-                    overload_token_usage_threshold,
-                    overlap_decay,
-                    selection_temperature,
+                    *cache_threshold,
+                    *balance_rel_threshold,
+                    *eviction_interval_secs,
+                    *max_tree_size,
+                    *block_size,
+                    *balance_token_usage_threshold,
+                    *overload_token_usage_threshold,
+                    *overlap_decay,
+                    *selection_temperature,
                     cache_index,
-                    cache_ttl_secs,
+                    *cache_ttl_secs,
                     cache_boundaries,
                 )?;
             }
@@ -545,17 +545,17 @@ impl ConfigValidator {
                 short_pool_max_load,
             } => {
                 Self::validate_cache_aware_shared(
-                    cache_threshold,
-                    balance_rel_threshold,
-                    eviction_interval_secs,
-                    max_tree_size,
-                    block_size,
-                    balance_token_usage_threshold,
-                    overload_token_usage_threshold,
-                    overlap_decay,
-                    selection_temperature,
+                    *cache_threshold,
+                    *balance_rel_threshold,
+                    *eviction_interval_secs,
+                    *max_tree_size,
+                    *block_size,
+                    *balance_token_usage_threshold,
+                    *overload_token_usage_threshold,
+                    *overlap_decay,
+                    *selection_temperature,
                     cache_index,
-                    cache_ttl_secs,
+                    *cache_ttl_secs,
                     cache_boundaries,
                 )?;
 
@@ -699,22 +699,22 @@ impl ConfigValidator {
     /// `CacheAware` and `CacheAwareLength` policy variants.
     #[expect(clippy::too_many_arguments, reason = "mirrors the PolicyConfig fields")]
     fn validate_cache_aware_shared(
-        cache_threshold: &f32,
-        balance_rel_threshold: &f32,
-        eviction_interval_secs: &u64,
-        max_tree_size: &usize,
-        block_size: &usize,
-        balance_token_usage_threshold: &f32,
-        overload_token_usage_threshold: &f32,
-        overlap_decay: &f32,
-        selection_temperature: &f32,
+        cache_threshold: f32,
+        balance_rel_threshold: f32,
+        eviction_interval_secs: u64,
+        max_tree_size: usize,
+        block_size: usize,
+        balance_token_usage_threshold: f32,
+        overload_token_usage_threshold: f32,
+        overlap_decay: f32,
+        selection_temperature: f32,
         cache_index: &CacheIndexKind,
-        cache_ttl_secs: &u64,
+        cache_ttl_secs: u64,
         cache_boundaries: &[usize],
     ) -> ConfigResult<()> {
         Self::validate_cache_boundaries(cache_boundaries)?;
 
-        if *cache_ttl_secs == 0 {
+        if cache_ttl_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "cache_ttl_secs".to_string(),
                 value: cache_ttl_secs.to_string(),
@@ -730,7 +730,7 @@ impl ConfigValidator {
             });
         }
 
-        if !overlap_decay.is_finite() || *overlap_decay < 0.0 {
+        if !overlap_decay.is_finite() || overlap_decay < 0.0 {
             return Err(ConfigError::InvalidValue {
                 field: "overlap_decay".to_string(),
                 value: overlap_decay.to_string(),
@@ -738,7 +738,7 @@ impl ConfigValidator {
             });
         }
 
-        if !selection_temperature.is_finite() || *selection_temperature < 0.0 {
+        if !selection_temperature.is_finite() || selection_temperature < 0.0 {
             return Err(ConfigError::InvalidValue {
                 field: "selection_temperature".to_string(),
                 value: selection_temperature.to_string(),
@@ -746,7 +746,7 @@ impl ConfigValidator {
             });
         }
 
-        if *block_size == 0 {
+        if block_size == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "block_size".to_string(),
                 value: block_size.to_string(),
@@ -754,9 +754,7 @@ impl ConfigValidator {
             });
         }
 
-        if !balance_token_usage_threshold.is_finite()
-            || *balance_token_usage_threshold <= 0.0
-        {
+        if !balance_token_usage_threshold.is_finite() || balance_token_usage_threshold <= 0.0 {
             return Err(ConfigError::InvalidValue {
                 field: "balance_token_usage_threshold".to_string(),
                 value: balance_token_usage_threshold.to_string(),
@@ -764,9 +762,7 @@ impl ConfigValidator {
             });
         }
 
-        if !overload_token_usage_threshold.is_finite()
-            || *overload_token_usage_threshold <= 0.0
-        {
+        if !overload_token_usage_threshold.is_finite() || overload_token_usage_threshold <= 0.0 {
             return Err(ConfigError::InvalidValue {
                 field: "overload_token_usage_threshold".to_string(),
                 value: overload_token_usage_threshold.to_string(),
@@ -774,7 +770,7 @@ impl ConfigValidator {
             });
         }
 
-        if !(0.0..=1.0).contains(cache_threshold) {
+        if !(0.0..=1.0).contains(&cache_threshold) {
             return Err(ConfigError::InvalidValue {
                 field: "cache_threshold".to_string(),
                 value: cache_threshold.to_string(),
@@ -782,7 +778,7 @@ impl ConfigValidator {
             });
         }
 
-        if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
+        if !balance_rel_threshold.is_finite() || balance_rel_threshold < 1.0 {
             return Err(ConfigError::InvalidValue {
                 field: "balance_rel_threshold".to_string(),
                 value: balance_rel_threshold.to_string(),
@@ -790,7 +786,7 @@ impl ConfigValidator {
             });
         }
 
-        if *eviction_interval_secs == 0 {
+        if eviction_interval_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "eviction_interval_secs".to_string(),
                 value: eviction_interval_secs.to_string(),
@@ -798,7 +794,7 @@ impl ConfigValidator {
             });
         }
 
-        if *max_tree_size == 0 {
+        if max_tree_size == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "max_tree_size".to_string(),
                 value: max_tree_size.to_string(),

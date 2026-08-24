@@ -113,6 +113,7 @@ pub(crate) trait NoCacheStrategy: Send + Sync + std::fmt::Debug {
     /// `cache_threshold`. It is `None` when no matching was attempted (e.g.
     /// imbalanced fallback, event-driven no-overlap, hash-path fallback), in
     /// which case the strategy should estimate from `info` as before.
+    #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
     fn select_no_cache(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -392,6 +393,7 @@ impl CacheAwarePolicy {
     /// `uncached_hint` is the estimated uncached-prefill token count from a
     /// partial cache match (below `cache_threshold`); `None` when no matching
     /// was attempted.
+    #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
     fn resolve_no_cache(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1350,6 +1352,7 @@ impl CacheAwarePolicy {
     /// Self-contained — when overlap is found, selects the worker with the best
     /// cache match. When no overlap (cold start, novel tokens, short request),
     /// falls back to min-load. Does NOT fall back to approximate token tree.
+    #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
     fn select_worker_event_driven(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1883,6 +1886,7 @@ impl CacheAwarePolicy {
     }
 
     /// Select worker using token-based tree (gRPC path)
+    #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
     fn select_worker_with_tokens(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -2032,6 +2036,7 @@ impl CacheAwarePolicy {
     }
 
     /// Select worker using string-based tree (HTTP path)
+    #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
     fn select_worker_with_text(
         &self,
         workers: &[Arc<dyn Worker>],
