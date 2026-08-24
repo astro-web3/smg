@@ -3149,15 +3149,19 @@ mod tests {
     // --- Step 2: global imbalance ---
 
     #[tokio::test]
-    async fn cal_step2_global_imbalance_picks_min_load() {
+    async fn cal_step2_high_load_long_worker_overflows_to_short() {
         let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
         let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
         let router = length_router(&[&url_s], &[&url_l]).await;
-        // Pin the long-pool worker high so the fleet is imbalanced (100 vs 0).
+        // Pin the long-pool worker at load 100 (exceeds long_pool_max_load=2).
+        // length_router has no KV load receiver, so is_kv_imbalanced is always
+        // false — the request takes the no-cache branch (Step 4), classified as
+        // long (200K ≥ 100K threshold), and the full long pool overflows to the
+        // idle short-pool worker.
         pin_worker(&router, &url_l, 100);
         let h = tokens_header(200_000);
         let routed = route_to_url(&router, "novel", Some(&h));
-        assert_eq!(routed, url_s, "imbalanced fleet → healthy min-load worker");
+        assert_eq!(routed, url_s, "long pool full → overflow to idle short worker");
     }
 
     // --- Step 3: cache hit ---

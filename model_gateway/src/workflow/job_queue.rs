@@ -573,9 +573,7 @@ impl JobQueue {
                     spec.worker_type = proto_worker_type;
                     spec.api_key.clone_from(&api_key);
                     spec.bootstrap_port = bootstrap_port;
-                    if is_long_pool {
-                        spec.labels.insert("pool".to_string(), "long".to_string());
-                    }
+                    apply_pool_label(&mut spec, is_long_pool);
                     apply_startup_worker_config(&mut spec, router_config);
                     let config = spec;
 
@@ -771,6 +769,15 @@ impl JobQueue {
 /// membership in `long_prefill_indices`.
 fn is_long_pool_index(index: usize, long_indices: &[usize]) -> bool {
     long_indices.contains(&index)
+}
+
+/// Stamp the `pool=long` label onto a worker spec when it belongs to the
+/// long pool. Called by both production (InitializeWorkersFromConfig) and
+/// tests so the labeling logic lives in one place.
+fn apply_pool_label(spec: &mut WorkerSpec, is_long_pool: bool) {
+    if is_long_pool {
+        spec.labels.insert("pool".to_string(), "long".to_string());
+    }
 }
 
 /// Stamp the router-config-derived fields onto a startup worker's spec: the
@@ -1015,12 +1022,11 @@ mod tests {
         assert!(workers[3].3, "P4 should be long pool");
         assert!(workers[4].3, "P5 should be long pool");
 
-        // Verify the label is actually applied to the WorkerSpec
+        // Verify the label is actually applied to the WorkerSpec via the
+        // shared production helper (not duplicated labeling logic).
         for (_, _, _, is_long_pool) in &workers {
             let mut spec = WorkerSpec::new("http://test:8000");
-            if *is_long_pool {
-                spec.labels.insert("pool".to_string(), "long".to_string());
-            }
+            apply_pool_label(&mut spec, *is_long_pool);
             if *is_long_pool {
                 assert_eq!(
                     spec.labels.get("pool").map(|s| s.as_str()),
