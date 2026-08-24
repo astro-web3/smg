@@ -794,4 +794,27 @@ mod tests {
             "no hint → header 200K > 100K threshold → long pool"
         );
     }
+
+    /// When no workers carry the `pool=long` label (long_indices empty),
+    /// a ≥100K request has no long pool to route to and falls through to
+    /// the short pool — which is the all-healthy min-load path.
+    #[test]
+    fn step4_no_long_pool_workers_routes_to_short_pool() {
+        let policy = CacheAwareLengthPolicy::with_config(test_config());
+        // Both workers are short pool (no "long" label).
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            make_worker("http://w1:8000", None, 0),
+            make_worker("http://w2:8000", None, 0),
+        ];
+        policy.init_workers(&workers);
+        let headers = tokens_headers(200_000);
+        let info = info_with_header(&headers, "novel prompt no match yet");
+        let idx = policy.select_worker(&workers, &info).unwrap();
+        // long_indices empty → all workers are short pool.
+        // ≥100K → select_long_request → long_pool empty → short pool min-load.
+        assert!(
+            idx < workers.len(),
+            "long pool empty → short pool min-load"
+        );
+    }
 }
