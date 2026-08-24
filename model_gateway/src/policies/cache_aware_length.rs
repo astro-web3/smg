@@ -45,6 +45,8 @@
 
 use std::sync::Arc;
 
+use tracing::debug;
+
 use super::{
     CacheAwareLengthConfig, CacheAwarePolicy, LoadBalancingPolicy, NoCacheStrategy,
     SelectWorkerInfo, UncachedHint,
@@ -223,9 +225,9 @@ impl NoCacheStrategy for LengthStrategy {
             .collect();
 
         let selected = if uncached >= self.long_prefill_threshold {
-            self.select_long_request(&long_pool, &short_pool, min_load_idx)
+            self.select_long_request(workers, &long_pool, &short_pool, min_load_idx, uncached)
         } else {
-            self.select_short_request(&long_pool, &short_pool, min_load_idx)
+            self.select_short_request(workers, &long_pool, &short_pool, min_load_idx, uncached)
         };
 
         // The inner policy's caller (select_worker_min_load, the tree
@@ -278,48 +280,111 @@ impl LengthStrategy {
     /// Long request (uncached >= long_prefill_threshold).
     fn select_long_request(
         &self,
+        workers: &[Arc<dyn Worker>],
         long_pool: &[(usize, usize, usize)],
         short_pool: &[(usize, usize, usize)],
         min_load_idx: Option<usize>,
+        uncached: usize,
     ) -> Option<usize> {
         if pool_has_free(long_pool, self.long_pool_max_load) {
-            return pool_min_load_worker(long_pool);
+            let idx = pool_min_load_worker(long_pool);
+            if let Some(i) = idx {
+                debug!(
+                    worker = workers[i].url(),
+                    uncached,
+                    pool = "long",
+                    "cache_aware_length: long request → long pool (has free worker)"
+                );
+            }
+            return idx;
         }
         // Long pool full/unhealthy: overflow to an idle short-pool worker only.
         if let Some(idx) = pool_idle_worker(short_pool) {
+            debug!(
+                worker = workers[idx].url(),
+                uncached,
+                pool = "short",
+                "cache_aware_length: long→short overflow (long pool full, short pool idle)"
+            );
             return Some(idx);
         }
         // Short pool all busy: queue on long pool if it still has a worker.
         if let Some(idx) = pool_min_load_worker(long_pool) {
+            debug!(
+                worker = workers[idx].url(),
+                uncached,
+                pool = "long",
+                "cache_aware_length: long request queued on long pool (short pool busy)"
+            );
             return Some(idx);
         }
         // Long pool fully unhealthy and short pool busy: all-healthy min-load.
+        debug!(
+            uncached,
+            "cache_aware_length: long request → all-healthy min-load (both pools exhausted)"
+        );
         min_load_idx
     }
 
     /// Short request (uncached < long_prefill_threshold).
     fn select_short_request(
         &self,
+        workers: &[Arc<dyn Worker>],
         long_pool: &[(usize, usize, usize)],
         short_pool: &[(usize, usize, usize)],
         min_load_idx: Option<usize>,
+        uncached: usize,
     ) -> Option<usize> {
         if pool_has_free(short_pool, self.short_pool_max_load) {
-            return pool_min_load_worker(short_pool);
+            let idx = pool_min_load_worker(short_pool);
+            if let Some(i) = idx {
+                debug!(
+                    worker = workers[i].url(),
+                    uncached,
+                    pool = "short",
+                    "cache_aware_length: short request → short pool (has free worker)"
+                );
+            }
+            return idx;
         }
         // Short pool full: overflow to long pool if it has a free worker.
         if pool_has_free(long_pool, self.long_pool_max_load) {
-            return pool_min_load_worker(long_pool);
+            let idx = pool_min_load_worker(long_pool);
+            if let Some(i) = idx {
+                debug!(
+                    worker = workers[i].url(),
+                    uncached,
+                    pool = "long",
+                    "cache_aware_length: short→long overflow (short pool full)"
+                );
+            }
+            return idx;
         }
         // Both full: queue on short pool if it has a worker.
         if let Some(idx) = pool_min_load_worker(short_pool) {
+            debug!(
+                worker = workers[idx].url(),
+                uncached,
+                pool = "short",
+                "cache_aware_length: short request queued on short pool (both full)"
+            );
             return Some(idx);
         }
         // Short pool empty: queue on long pool if it has a worker.
         if let Some(idx) = pool_min_load_worker(long_pool) {
+            debug!(
+                worker = workers[idx].url(),
+                uncached,
+                pool = "long",
+                "cache_aware_length: short request → long pool (short pool empty)"
+            );
             return Some(idx);
         }
         // Both pools empty: all-healthy min-load.
+        debug!(
+            uncached,
+            "cache_aware_length: short request → all-healthy min-load (both pools empty)"
+        );
         min_load_idx
     }
 }
