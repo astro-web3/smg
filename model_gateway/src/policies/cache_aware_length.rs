@@ -45,7 +45,7 @@
 
 use std::sync::Arc;
 
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::{
     CacheAwareLengthConfig, CacheAwarePolicy, LoadBalancingPolicy, NoCacheStrategy,
@@ -300,7 +300,7 @@ impl LengthStrategy {
         }
         // Long pool full/unhealthy: overflow to an idle short-pool worker only.
         if let Some(idx) = pool_idle_worker(short_pool) {
-            debug!(
+            info!(
                 worker = workers[idx].url(),
                 uncached,
                 pool = "short",
@@ -310,7 +310,7 @@ impl LengthStrategy {
         }
         // Short pool all busy: queue on long pool if it still has a worker.
         if let Some(idx) = pool_min_load_worker(long_pool) {
-            debug!(
+            info!(
                 worker = workers[idx].url(),
                 uncached,
                 pool = "long",
@@ -319,7 +319,7 @@ impl LengthStrategy {
             return Some(idx);
         }
         // Long pool fully unhealthy and short pool busy: all-healthy min-load.
-        debug!(
+        info!(
             uncached,
             "cache_aware_length: long request → all-healthy min-load (both pools exhausted)"
         );
@@ -351,7 +351,7 @@ impl LengthStrategy {
         if pool_has_free(long_pool, self.long_pool_max_load) {
             let idx = pool_min_load_worker(long_pool);
             if let Some(i) = idx {
-                debug!(
+                info!(
                     worker = workers[i].url(),
                     uncached,
                     pool = "long",
@@ -362,7 +362,7 @@ impl LengthStrategy {
         }
         // Both full: queue on short pool if it has a worker.
         if let Some(idx) = pool_min_load_worker(short_pool) {
-            debug!(
+            info!(
                 worker = workers[idx].url(),
                 uncached,
                 pool = "short",
@@ -372,7 +372,7 @@ impl LengthStrategy {
         }
         // Short pool empty: queue on long pool if it has a worker.
         if let Some(idx) = pool_min_load_worker(long_pool) {
-            debug!(
+            info!(
                 worker = workers[idx].url(),
                 uncached,
                 pool = "long",
@@ -381,7 +381,7 @@ impl LengthStrategy {
             return Some(idx);
         }
         // Both pools empty: all-healthy min-load.
-        debug!(
+        info!(
             uncached,
             "cache_aware_length: short request → all-healthy min-load (both pools empty)"
         );
