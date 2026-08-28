@@ -21,6 +21,7 @@ from grpc_reflection.v1alpha import reflection
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.managers.disagg_service import start_disagg_service
+from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
@@ -51,6 +52,18 @@ async def serve_grpc(
             this to wire its admin endpoints to the scheduler, so the
             callback signature is a public contract.
     """
+
+    # Install the process-wide runtime context before any sglang machinery
+    # runs here. Since 0.5.18 the config is published per process and read
+    # through `get_parallel()` rather than threaded from ServerArgs, so
+    # anything that reads a parallel dimension (the load-snapshot reader is
+    # the first) raises "config not published" until this happens. This
+    # process fills sglang's TokenizerManager role, so it publishes the
+    # tokenizer role exactly as the upstream engine entry point does; the
+    # scheduler subprocesses publish their own role when they start.
+    # Re-publish is last-publish-wins upstream, so this is safe if the caller
+    # already published.
+    publish(server_args, role="tokenizer")
 
     # Start bootstrap server BEFORE launching scheduler processes (only in PREFILL mode)
     # This ensures the bootstrap server is ready when prefill schedulers try to register
@@ -143,7 +156,7 @@ async def serve_grpc(
             # Without this, the gRPC C-core default (300s minimum) causes
             # GOAWAY when clients send pings more frequently during long
             # requests (e.g. prefill) where no DATA frames flow.
-            ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
+            ("grpc.http2.min_ping_interval_without_data_ms", 10000),
             ("grpc.keepalive_permit_without_calls", True),
         ],
     )

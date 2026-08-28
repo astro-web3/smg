@@ -440,7 +440,7 @@ impl StreamingProcessor {
 
                     // Process tokens through stop decoder
                     let (chunk_text, should_stop) =
-                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids());
+                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
 
                     if should_stop {
                         // Stop-decoder match takes precedence: pin "stop" even if
@@ -626,9 +626,29 @@ impl StreamingProcessor {
             }
         }
 
-        // Phase 3: Check unstreamed tool args
+        // Phase 3: End-of-stream parser flush: first any text still buffered
+        // as a prospective tool call that never materialized (dropping it
+        // produced fully-empty streams), then any parsed-but-unstreamed tool
+        // arguments.
         for (index, parser) in &tool_parsers {
-            let parser_guard = parser.lock().await;
+            let mut parser_guard = parser.lock().await;
+
+            let leftover_text = parser_guard.take_unstreamed_normal_text();
+            if !leftover_text.is_empty() {
+                let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                    .created(created)
+                    .add_choice_content(*index, "assistant", leftover_text)
+                    .maybe_system_fingerprint(system_fingerprint)
+                    .build();
+
+                let sse_chunk = sse_encoder
+                    .encode_data(&content_chunk)
+                    .map_err(|e| format!("Failed to serialize content chunk: {e}"))?;
+                tx.send(Ok(sse_chunk))
+                    .await
+                    .map_err(|_| "Failed to send flushed content chunk".to_string())?;
+            }
+
             if let Some(unstreamed_items) = parser_guard.get_unstreamed_tool_args() {
                 for tool_call_item in unstreamed_items {
                     let tool_call_delta = ToolCallDelta {
@@ -1327,34 +1347,36 @@ impl StreamingProcessor {
     }
 
     /// Process a chunk of tokens through the stop decoder
+    ///
+    /// Decode errors are propagated instead of being treated as `Held`:
+    /// swallowing them would drop the affected text while any configured
+    /// stop sequence silently stops matching, letting the stream run on
+    /// with missing output.
     fn process_chunk_tokens(
         stop_decoder: &mut StopSequenceDecoder,
         token_ids: &[u32],
-    ) -> (String, bool) {
+    ) -> Result<(String, bool), String> {
         let mut chunk_text = String::new();
 
         for &token_id in token_ids {
-            match stop_decoder.process_token(token_id).unwrap_or_else(|e| {
-                debug!(
-                    "Error processing token {}: {}. Treating as Held.",
-                    token_id, e
-                );
-                SequenceDecoderOutput::Held
-            }) {
+            match stop_decoder
+                .process_token(token_id)
+                .map_err(|e| format!("Stop decoder failed to process token {token_id}: {e}"))?
+            {
                 SequenceDecoderOutput::Text(text) => {
                     chunk_text.push_str(&text);
                 }
                 SequenceDecoderOutput::StoppedWithText(text) => {
                     chunk_text.push_str(&text);
-                    return (chunk_text, true);
+                    return Ok((chunk_text, true));
                 }
                 SequenceDecoderOutput::Stopped => {
-                    return (chunk_text, true);
+                    return Ok((chunk_text, true));
                 }
                 SequenceDecoderOutput::Held => {}
             }
         }
-        (chunk_text, false)
+        Ok((chunk_text, false))
     }
 
     /// Helper: Process reasoning content in streaming mode
@@ -2000,15 +2022,7 @@ impl StreamingProcessor {
             model: model.clone(),
             stop_reason: None,
             stop_sequence: None,
-            usage: messages::Usage {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
-                cache_creation: None,
-                server_tool_use: None,
-                service_tier: None,
-            },
+            usage: Self::initial_messages_usage(),
         };
         Self::send_messages_event(
             tx,
@@ -2041,7 +2055,7 @@ impl StreamingProcessor {
                     completion_tokens.record_chunk(&chunk);
 
                     let (chunk_text, should_stop) =
-                        Self::process_chunk_tokens(&mut stop_decoder, chunk.token_ids());
+                        Self::process_chunk_tokens(&mut stop_decoder, chunk.token_ids())?;
 
                     if should_stop {
                         // Stop-decoder match takes precedence over the engine's
@@ -2348,7 +2362,42 @@ impl StreamingProcessor {
             }
         }
 
-        // Phase 3: Flush unstreamed tool args from the incremental parser
+        // Phase 3: End-of-stream parser flush: first any text still buffered
+        // as a prospective tool call that never materialized (dropping it
+        // produced fully-empty streams), then any parsed-but-unstreamed tool
+        // arguments.
+        if let Some(ref mut parser) = streaming_tool_parser {
+            let leftover_text = parser.take_unstreamed_normal_text();
+            if !leftover_text.is_empty() {
+                if !text_block_open {
+                    Self::send_messages_event(
+                        tx,
+                        &mut sse_buffer,
+                        &MessageStreamEvent::ContentBlockStart {
+                            index: current_block_index,
+                            content_block: ContentBlock::Text {
+                                text: String::new(),
+                                citations: None,
+                            },
+                        },
+                    )
+                    .await?;
+                    text_block_open = true;
+                }
+                Self::send_messages_event(
+                    tx,
+                    &mut sse_buffer,
+                    &MessageStreamEvent::ContentBlockDelta {
+                        index: current_block_index,
+                        delta: ContentBlockDelta::TextDelta {
+                            text: leftover_text,
+                        },
+                    },
+                )
+                .await?;
+            }
+        }
+
         if let Some(ref parser) = streaming_tool_parser {
             if let Some(unstreamed_items) = parser.get_unstreamed_tool_args() {
                 for tool_call_item in unstreamed_items {
@@ -2480,13 +2529,10 @@ impl StreamingProcessor {
                     stop_reason,
                     stop_sequence,
                 },
-                usage: MessageDeltaUsage {
-                    output_tokens: completion_tokens.total(),
-                    input_tokens: None,
-                    cache_creation_input_tokens: None,
-                    cache_read_input_tokens: None,
-                    server_tool_use: None,
-                },
+                usage: Self::final_messages_delta_usage(
+                    completion_tokens.total(),
+                    saw_complete.then_some(prompt_tokens),
+                ),
             },
         )
         .await?;
@@ -2877,7 +2923,7 @@ impl StreamingProcessor {
                     });
 
                     let (decoded_text, stopped) =
-                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids());
+                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
                     chunk_text.clear();
                     chunk_text.push_str(&decoded_text);
 
@@ -3187,6 +3233,39 @@ impl StreamingProcessor {
             .with_cached_tokens(total_cached)
             .with_reasoning_tokens(total_reasoning)
     }
+
+    /// Skeleton usage for the `message_start` event. Cache counters are
+    /// integer zeros, never null: the Anthropic wire contract has
+    /// always-present cache counters and clients do arithmetic on them.
+    fn initial_messages_usage() -> messages::Usage {
+        messages::Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+            cache_creation: None,
+            server_tool_use: None,
+            service_tier: None,
+        }
+    }
+
+    /// Usage for the final `message_delta` event. `authoritative_input` is the
+    /// prompt count only when a `Complete` was seen; a clean EOF without one
+    /// must serialize `input_tokens: null` rather than claim a zero-token
+    /// prompt. Cache counters follow the same integer-not-null contract as
+    /// [`Self::initial_messages_usage`].
+    fn final_messages_delta_usage(
+        output_tokens: u32,
+        authoritative_input: Option<u32>,
+    ) -> MessageDeltaUsage {
+        MessageDeltaUsage {
+            output_tokens,
+            input_tokens: authoritative_input,
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+            server_tool_use: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3214,5 +3293,102 @@ mod tests {
                 .and_then(|details| details.reasoning_tokens),
             Some(3)
         );
+    }
+
+    /// Wire contract: cache counters serialize as integer zeros, never null,
+    /// in both the message_start skeleton and the final message_delta usage.
+    #[test]
+    fn messages_usage_cache_counters_serialize_as_integer_zeros() {
+        let start = serde_json::to_value(StreamingProcessor::initial_messages_usage()).unwrap();
+        assert_eq!(start["input_tokens"], 0);
+        assert_eq!(start["output_tokens"], 0);
+        assert_eq!(start["cache_creation_input_tokens"], 0);
+        assert_eq!(start["cache_read_input_tokens"], 0);
+
+        let delta =
+            serde_json::to_value(StreamingProcessor::final_messages_delta_usage(15, Some(25)))
+                .unwrap();
+        assert_eq!(delta["output_tokens"], 15);
+        assert_eq!(delta["input_tokens"], 25);
+        assert_eq!(delta["cache_creation_input_tokens"], 0);
+        assert_eq!(delta["cache_read_input_tokens"], 0);
+    }
+
+    /// A clean EOF without a `Complete` message has no authoritative prompt
+    /// count: `input_tokens` must serialize as null, not a fabricated zero.
+    #[test]
+    fn message_delta_input_tokens_null_without_authoritative_usage() {
+        let delta =
+            serde_json::to_value(StreamingProcessor::final_messages_delta_usage(15, None)).unwrap();
+        assert!(delta["input_tokens"].is_null());
+        assert_eq!(delta["cache_creation_input_tokens"], 0);
+    }
+
+    /// Tokenizer whose decode always fails, simulating a broken deployment
+    /// (corrupt or mismatched tokenizer files).
+    struct FailingTokenizer {
+        special_tokens: llm_tokenizer::SpecialTokens,
+    }
+
+    impl llm_tokenizer::Encoder for FailingTokenizer {
+        fn encode(
+            &self,
+            _input: &str,
+            _add_special_tokens: bool,
+        ) -> anyhow::Result<llm_tokenizer::Encoding> {
+            Err(anyhow::anyhow!("encode is not supported"))
+        }
+
+        fn encode_batch(
+            &self,
+            _inputs: &[&str],
+            _add_special_tokens: bool,
+        ) -> anyhow::Result<Vec<llm_tokenizer::Encoding>> {
+            Err(anyhow::anyhow!("encode_batch is not supported"))
+        }
+    }
+
+    impl llm_tokenizer::Decoder for FailingTokenizer {
+        fn decode(&self, _token_ids: &[u32], _skip_special_tokens: bool) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!("tokenizer decode failed"))
+        }
+    }
+
+    impl Tokenizer for FailingTokenizer {
+        fn vocab_size(&self) -> usize {
+            0
+        }
+
+        fn get_special_tokens(&self) -> &llm_tokenizer::SpecialTokens {
+            &self.special_tokens
+        }
+
+        fn token_to_id(&self, _token: &str) -> Option<u32> {
+            None
+        }
+
+        fn id_to_token(&self, _id: u32) -> Option<String> {
+            None
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn process_chunk_tokens_propagates_decode_errors() {
+        // A decode error must surface instead of being swallowed as `Held`,
+        // which would drop the text and let a configured stop silently miss.
+        let tokenizer = Arc::new(FailingTokenizer {
+            special_tokens: llm_tokenizer::SpecialTokens::default(),
+        });
+        let config = llm_tokenizer::StopSequenceConfig::default().with_stop_sequence("STOP");
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        let result = StreamingProcessor::process_chunk_tokens(&mut decoder, &[1, 2]);
+
+        let err = result.expect_err("decode failure must propagate");
+        assert!(err.contains("Stop decoder failed to process token"));
     }
 }

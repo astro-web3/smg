@@ -510,7 +510,12 @@ impl JobQueue {
                     } => {
                         let prefill_workers =
                             prefill_urls.iter().enumerate().map(|(i, (url, port))| {
-                                (url.clone(), "prefill", *port, is_long_pool_index(i, long_indices))
+                                (
+                                    url.clone(),
+                                    "prefill",
+                                    *port,
+                                    is_long_pool_index(i, long_indices),
+                                )
                             });
 
                         let decode_workers = decode_urls
@@ -530,7 +535,12 @@ impl JobQueue {
                             .map(|(url, port)| (url.clone(), "encode", *port, false));
                         let prefill_workers =
                             prefill_urls.iter().enumerate().map(|(i, (url, port))| {
-                                (url.clone(), "prefill", *port, is_long_pool_index(i, long_indices))
+                                (
+                                    url.clone(),
+                                    "prefill",
+                                    *port,
+                                    is_long_pool_index(i, long_indices),
+                                )
                             });
                         let decode_workers = decode_urls
                             .iter()
@@ -1010,7 +1020,12 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (url, port))| {
-                (url.clone(), "prefill", *port, is_long_pool_index(i, &long_indices))
+                (
+                    url.clone(),
+                    "prefill",
+                    *port,
+                    is_long_pool_index(i, &long_indices),
+                )
             })
             .collect();
 
@@ -1056,7 +1071,12 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (url, port))| {
-                (url.clone(), "prefill", *port, is_long_pool_index(i, &long_indices))
+                (
+                    url.clone(),
+                    "prefill",
+                    *port,
+                    is_long_pool_index(i, &long_indices),
+                )
             })
             .collect();
 

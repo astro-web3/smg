@@ -12,7 +12,10 @@ use tracing::{error, warn};
 use super::PipelineStage;
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
+    policies::{
+        policy_filters_unavailable_workers, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo,
+        WorkerLeg,
+    },
     routers::{
         common::overload,
         error,
@@ -22,8 +25,8 @@ use crate::{
         },
     },
     worker::{
-        ConnectionMode, ConnectionModeExt, HashRing, RuntimeType, Worker, WorkerRegistry,
-        WorkerType, UNKNOWN_MODEL_ID,
+        ConnectionModeExt, HashRing, ModelWorkerSnapshot, RoutingPool, RuntimeType, Worker,
+        WorkerRegistry, WorkerType,
     },
 };
 
@@ -246,23 +249,20 @@ impl WorkerSelectionStage {
     /// under the same worker-type and transport rules selection applied.
     /// Failure path only.
     fn leg_candidates(&self, model_id: &str, worker_type: WorkerType) -> Vec<Arc<dyn Worker>> {
-        // The wildcard model selects across every model, so its candidate pool
-        // is the unfiltered one — not the `unknown` model-index entry.
-        let model_filter = if model_id == UNKNOWN_MODEL_ID {
-            None
-        } else {
-            Some(model_id)
+        // One definition shared with selection: the same routing-pool
+        // projection, before the `is_available()` filter. Regular selection
+        // takes either gRPC-pipeline transport; the disaggregated legs are
+        // gRPC-only (no KV rendezvous on ZMQ). The wildcard model maps to
+        // the global snapshot — not the `unknown` model-index entry.
+        let pool = match worker_type {
+            WorkerType::Regular => RoutingPool::GrpcPipelineRegular,
+            WorkerType::Prefill => RoutingPool::GrpcPrefill,
+            WorkerType::Decode => RoutingPool::GrpcDecode,
+            WorkerType::Encode => RoutingPool::GrpcEncode,
         };
         self.worker_registry
-            .get_workers_filtered(model_filter, Some(worker_type), None, None, false)
-            .into_iter()
-            .filter(|w| match worker_type {
-                // Regular selection takes either gRPC-pipeline transport; the
-                // disaggregated legs are gRPC-only (no KV rendezvous on ZMQ).
-                WorkerType::Regular => w.connection_mode().uses_grpc_pipeline(),
-                _ => *w.connection_mode() == ConnectionMode::Grpc,
-            })
-            .collect()
+            .get_routing_pool(model_id, pool)
+            .to_vec()
     }
 
     fn select_single_worker(
@@ -273,35 +273,29 @@ impl WorkerSelectionStage {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
     ) -> Option<Arc<dyn Worker>> {
-        // Treat "unknown" model as wildcard (match any worker)
-        let model_filter = if model_id == UNKNOWN_MODEL_ID {
-            None
-        } else {
-            Some(model_id)
-        };
-
         // Get workers for the specified model. The gRPC router serves both gRPC
         // and direct-ZMQ workers, so accept either transport (not HTTP).
-        let workers = self.worker_registry.get_workers_filtered(
-            model_filter,
-            Some(WorkerType::Regular),
-            None,  // grpc + zmq, filtered below
-            None,  // any runtime type
-            false, // get all workers, we'll filter by is_available() next
-        );
-
-        // Use into_iter() to take ownership of Arcs without cloning (avoids atomic inc/dec)
-        let available: Vec<Arc<dyn Worker>> = workers
-            .into_iter()
-            .filter(|w| w.connection_mode().uses_grpc_pipeline() && w.is_available())
-            .collect();
-
-        if available.is_empty() {
-            return None;
-        }
+        let candidates = self
+            .worker_registry
+            .get_routing_pool(model_id, RoutingPool::GrpcPipelineRegular);
 
         // Get the appropriate policy for this model
         let policy = self.policy_registry.get_policy_or_default(model_id);
+
+        let filtered;
+        let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
+            &candidates
+        } else {
+            filtered = candidates
+                .iter()
+                .filter(|worker| worker.is_available())
+                .cloned()
+                .collect::<Vec<_>>();
+            &filtered
+        };
+        if available.is_empty() {
+            return None;
+        }
 
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
@@ -310,7 +304,7 @@ impl WorkerSelectionStage {
         // when enabled; otherwise delegates to the configured policy).
         let idx = self.policy_registry.select_worker(
             &policy,
-            &available,
+            available,
             &SelectWorkerInfo {
                 request_text: text,
                 tokens,
@@ -334,6 +328,20 @@ impl WorkerSelectionStage {
         Some(selected)
     }
 
+    /// Workers from one leg pool of `snapshot` that also pass the live
+    /// `is_available()` check (health, circuit breaker, overload veto).
+    fn available_workers(
+        snapshot: &ModelWorkerSnapshot,
+        pool: RoutingPool,
+    ) -> Vec<Arc<dyn Worker>> {
+        snapshot
+            .pool(pool)
+            .iter()
+            .filter(|w| w.is_available())
+            .cloned()
+            .collect()
+    }
+
     fn select_pd_pair(
         &self,
         model_id: &str,
@@ -342,43 +350,15 @@ impl WorkerSelectionStage {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
     ) -> Option<PdWorkerPair> {
-        // Treat "unknown" model as wildcard (match any worker)
-        let model_filter = if model_id == UNKNOWN_MODEL_ID {
-            None
-        } else {
-            Some(model_id)
-        };
-
-        // Filtered to gRPC below: PD legs cannot ride the ZMQ transport.
-        let all_workers = self.worker_registry.get_workers_filtered(
-            model_filter,
-            None,
-            None, // filtered below
-            None, // any runtime type
-            false,
-        );
-
-        let (all_prefill, all_decode): (Vec<_>, Vec<_>) =
-            all_workers
-                .into_iter()
-                .fold((Vec::new(), Vec::new()), |mut acc, w| {
-                    // Only gRPC legs, not every grpc-pipeline mode: the ZMQ
-                    // wire carries no KV-transfer rendezvous, so a ZMQ leg
-                    // would silently drop the PD bootstrap info. Registration
-                    // rejects such workers; this keeps any that slipped in
-                    // (remote/service-discovery paths) out of PD pairs.
-                    if *w.connection_mode() == ConnectionMode::Grpc && w.is_available() {
-                        match w.metadata().spec.worker_type {
-                            WorkerType::Prefill => acc.0.push(w),
-                            WorkerType::Decode => acc.1.push(w),
-                            WorkerType::Regular => {}
-                            // Encode-prefill-decode selection is handled in select_encode_prefill_decode_workers;
-                            // the PD pair fold ignores encode workers.
-                            WorkerType::Encode => {}
-                        }
-                    }
-                    acc
-                });
+        // Both legs derive from ONE membership snapshot: separate pool
+        // lookups could straddle a concurrent replacement and pair workers
+        // that never coexisted. The pools are strictly gRPC (a ZMQ leg would
+        // silently drop the PD bootstrap info, see `RoutingPool::GrpcPrefill`;
+        // the wildcard model maps to the global snapshot), and availability
+        // stays a live per-request check.
+        let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+        let all_prefill = Self::available_workers(&snapshot, RoutingPool::GrpcPrefill);
+        let all_decode = Self::available_workers(&snapshot, RoutingPool::GrpcDecode);
 
         if all_prefill.is_empty() {
             warn!("No available prefill workers");
@@ -497,38 +477,16 @@ impl WorkerSelectionStage {
         rid_key: Option<&str>,
         encode_item_hashes: &[Vec<u8>],
     ) -> Option<EncodePrefillDecodeWorkerSelection> {
-        // Treat "unknown" model as wildcard (match any worker)
-        let model_filter = if model_id == UNKNOWN_MODEL_ID {
-            None
-        } else {
-            Some(model_id)
-        };
-
-        // Filtered to gRPC below: no EPD leg can ride the ZMQ transport.
-        let all_workers = self.worker_registry.get_workers_filtered(
-            model_filter,
-            None,
-            None, // filtered below
-            None, // any runtime type
-            false,
-        );
-
-        let (all_encode, all_prefill, all_decode): (Vec<_>, Vec<_>, Vec<_>) = all_workers
-            .into_iter()
-            .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, w| {
-                // Only gRPC legs: encode dispatch is a gRPC encoder RPC the
-                // direct-ZMQ worker has no path for, and the ZMQ wire carries
-                // no KV-transfer rendezvous for the prefill/decode legs.
-                if *w.connection_mode() == ConnectionMode::Grpc && w.is_available() {
-                    match w.metadata().spec.worker_type {
-                        WorkerType::Encode => acc.0.push(w),
-                        WorkerType::Prefill => acc.1.push(w),
-                        WorkerType::Decode => acc.2.push(w),
-                        WorkerType::Regular => {}
-                    }
-                }
-                acc
-            });
+        // All three legs derive from ONE membership snapshot (see
+        // select_pd_pair). The pools are strictly gRPC — encode dispatch is
+        // a gRPC encoder RPC the direct-ZMQ worker has no path for, and the
+        // ZMQ wire carries no KV-transfer rendezvous for the prefill/decode
+        // legs; the wildcard model maps to the global snapshot. Availability
+        // stays a live per-request check.
+        let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+        let all_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
+        let all_prefill = Self::available_workers(&snapshot, RoutingPool::GrpcPrefill);
+        let all_decode = Self::available_workers(&snapshot, RoutingPool::GrpcDecode);
 
         let needs_encode = !encode_item_hashes.is_empty();
         if needs_encode && all_encode.is_empty() {

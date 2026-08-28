@@ -29,8 +29,8 @@ mod round_robin;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
-pub(crate) use cache_aware::{NoCacheStrategy, UncachedHint};
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
+pub(crate) use cache_aware::{NoCacheStrategy, UncachedHint};
 pub use cache_aware_length::CacheAwareLengthPolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
@@ -109,6 +109,19 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 
     /// Get as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// Whether a built-in policy applies the complete [`Worker::is_available`]
+/// predicate before selecting. Other policies keep the caller-side filter.
+pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolicy) -> bool {
+    let policy = policy.as_any();
+    policy.is::<RandomPolicy>()
+        || policy.is::<RoundRobinPolicy>()
+        || policy.is::<LeastLoadPolicy>()
+        || policy.is::<PowerOfTwoPolicy>()
+        || policy.is::<CacheAwarePolicy>()
+        || policy.is::<ManualPolicy>()
+        || policy.is::<PassthroughPolicy>()
 }
 
 pub trait DPRankLoadPolicy: Send + Sync + Debug {
@@ -460,5 +473,122 @@ mod tests {
         assert_eq!(WorkerLeg::Single.routing_id_prefix(), "");
         assert_eq!(WorkerLeg::Prefill.routing_id_prefix(), "prefill:");
         assert_eq!(WorkerLeg::Decode.routing_id_prefix(), "decode:");
+    }
+
+    #[test]
+    fn only_policies_with_complete_availability_checks_skip_prefiltering() {
+        for name in [
+            "random",
+            "round_robin",
+            "least_load",
+            "power_of_two",
+            "cache_aware",
+            "manual",
+            "passthrough",
+        ] {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+            assert!(
+                policy_filters_unavailable_workers(policy.as_ref()),
+                "{name}"
+            );
+        }
+
+        for name in ["bucket", "consistent_hashing", "prefix_hash"] {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+            assert!(
+                !policy_filters_unavailable_workers(policy.as_ref()),
+                "{name}"
+            );
+        }
+    }
+
+    /// The allowlist above is only sound if every listed policy actually
+    /// applies the complete `is_available()` predicate itself: callers skip
+    /// the pre-filter for them. Two scenarios pin the two halves:
+    /// the overload veto (shared with the weaker `is_healthy_and_eligible`
+    /// predicate) and an open circuit breaker — the one signal that
+    /// separates the full predicate from the weak one, so a policy that
+    /// regresses to the weak predicate fails here.
+    #[test]
+    fn allowlisted_policies_reject_unavailable_workers() {
+        use std::{sync::Arc, time::Duration};
+
+        use openai_protocol::worker::WorkerStatus;
+
+        use crate::worker::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, Worker};
+
+        fn worker(url: &str) -> Arc<dyn Worker> {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .circuit_breaker_config(CircuitBreakerConfig {
+                        failure_threshold: 1,
+                        success_threshold: 1,
+                        timeout_duration: Duration::from_secs(600),
+                        window_duration: Duration::from_secs(600),
+                    })
+                    .build(),
+            );
+            worker.set_status(WorkerStatus::Ready);
+            worker
+        }
+
+        fn overloaded(url: &str) -> Arc<dyn Worker> {
+            let worker = worker(url);
+            worker.set_overloaded(true);
+            worker
+        }
+
+        fn breaker_open(url: &str) -> Arc<dyn Worker> {
+            let worker = worker(url);
+            worker.record_outcome(500);
+            assert!(!worker.is_available(), "breaker must be open");
+            assert!(
+                worker.is_healthy_and_eligible(),
+                "the weak predicate must still accept it — that contrast is \
+                 what this scenario tests"
+            );
+            worker
+        }
+
+        for name in [
+            "random",
+            "round_robin",
+            "least_load",
+            "power_of_two",
+            "cache_aware",
+            "manual",
+            "passthrough",
+        ] {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+
+            // Every worker vetoed or circuit-broken: the policy must come up
+            // empty on its own.
+            for unavailable in [
+                [overloaded("http://a:1"), overloaded("http://b:1")],
+                [breaker_open("http://a:1"), breaker_open("http://b:1")],
+            ] {
+                assert_eq!(
+                    policy.select_worker(&unavailable, &SelectWorkerInfo::default()),
+                    None,
+                    "{name} selected an unavailable worker"
+                );
+            }
+
+            // Mixed pools: the selection must exist and land on the
+            // available worker.
+            for mixed in [
+                [worker("http://a:1"), overloaded("http://b:1")],
+                [worker("http://a:1"), breaker_open("http://b:1")],
+            ] {
+                for _ in 0..16 {
+                    let idx = policy
+                        .select_worker(&mixed, &SelectWorkerInfo::default())
+                        .unwrap_or_else(|| {
+                            panic!("{name} found no worker despite an available one")
+                        });
+                    assert_eq!(idx, 0, "{name} selected the unavailable worker");
+                }
+            }
+        }
     }
 }

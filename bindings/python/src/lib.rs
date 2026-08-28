@@ -515,7 +515,6 @@ struct Router {
     selection_temperature: f32,
     upstream_pool_idle_timeout_secs: u64,
     least_load_max_waiting_requests: u32,
-    stream_request_bodies_over: u64,
     stream_body_stall_timeout_secs: u64,
     routing_key_headers: Vec<String>,
     cache_boundaries: Vec<usize>,
@@ -532,6 +531,7 @@ struct Router {
     long_pool_max_load: usize,
     short_pool_max_load: usize,
     long_prefill_indices: Vec<usize>,
+    max_buffered_request_bytes: u64,
 }
 
 impl Router {
@@ -931,7 +931,7 @@ impl Router {
             .dp_aware(self.dp_aware)
             .upstream_http2(self.upstream_http2)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
-            .stream_request_bodies_over(self.stream_request_bodies_over)
+            .max_buffered_request_bytes(self.max_buffered_request_bytes)
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
@@ -1097,7 +1097,6 @@ impl Router {
         selection_temperature = 0.0,
         upstream_pool_idle_timeout_secs = 3,
         least_load_max_waiting_requests = 0,
-        stream_request_bodies_over = 0,
         stream_body_stall_timeout_secs = 300,
         routing_key_headers = vec![String::from("x-smg-routing-key")],
         cache_boundaries = vec![],
@@ -1114,6 +1113,7 @@ impl Router {
         long_pool_max_load = 4,
         short_pool_max_load = 32,
         long_prefill_indices = vec![],
+        max_buffered_request_bytes = 1_048_576,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1252,7 +1252,6 @@ impl Router {
         selection_temperature: f32,
         upstream_pool_idle_timeout_secs: u64,
         least_load_max_waiting_requests: u32,
-        stream_request_bodies_over: u64,
         stream_body_stall_timeout_secs: u64,
         routing_key_headers: Vec<String>,
         cache_boundaries: Vec<usize>,
@@ -1269,6 +1268,7 @@ impl Router {
         long_pool_max_load: usize,
         short_pool_max_load: usize,
         long_prefill_indices: Vec<usize>,
+        max_buffered_request_bytes: u64,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1421,7 +1421,6 @@ impl Router {
             selection_temperature,
             upstream_pool_idle_timeout_secs,
             least_load_max_waiting_requests,
-            stream_request_bodies_over,
             stream_body_stall_timeout_secs,
             routing_key_headers,
             cache_boundaries,
@@ -1438,6 +1437,7 @@ impl Router {
             long_pool_max_load,
             short_pool_max_load,
             long_prefill_indices,
+            max_buffered_request_bytes,
         })
     }
 

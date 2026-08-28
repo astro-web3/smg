@@ -8,6 +8,7 @@ pub mod event;
 pub mod hash_ring;
 pub mod http_client;
 pub mod kv_event_monitor;
+pub(crate) mod load_state;
 pub mod manager;
 pub mod metrics_aggregator;
 pub mod monitor;
@@ -43,6 +44,7 @@ pub use openai_protocol::{
     worker::{ProviderType, WorkerGroupKey},
 };
 pub use overload::OverloadThresholds;
+pub(crate) use registry::{ModelWorkerSnapshot, RoutingPool};
 pub use registry::{WorkerOrigin, WorkerRegistry};
 pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES};
 pub use sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL;

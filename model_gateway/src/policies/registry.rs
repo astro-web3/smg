@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
 };
 
@@ -377,7 +377,7 @@ impl PolicyRegistry {
 
     /// Set the backend load-snapshot receiver (thread-safe, can be called after
     /// initialization). Propagates to all existing cache-aware policies.
-    pub fn set_load_receiver(&self, rx: Option<LoadReceiver>) {
+    pub(crate) fn set_load_receiver(&self, rx: Option<LoadReceiver>) {
         {
             let mut guard = self.load_rx.write();
             guard.clone_from(&rx);
@@ -870,6 +870,30 @@ impl PolicyRegistry {
                             worker_url, worker_type
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// Remove a batch of workers from every cache-aware policy that may route
+    /// the model. Shared policies are deduplicated by Arc identity.
+    pub(crate) fn remove_workers_from_cache_aware(
+        &self,
+        model_id: &str,
+        worker_urls: &HashSet<String>,
+    ) {
+        // A model can route through its explicit, default, or PD/EPD policy.
+        // `policies_for_model` deduplicates shared policy instances so each
+        // tree is cleaned at most once.
+        for policy in self.policies_for_model(model_id) {
+            if policy.name() == "cache_aware" {
+                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                    cache_aware.remove_workers_from_model(model_id, worker_urls);
+                    debug!(
+                        "Removed {} workers from cache-aware policy for model {}",
+                        worker_urls.len(),
+                        model_id
+                    );
                 }
             }
         }
@@ -1831,7 +1855,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_aware_is_load_aware_only_when_pressure_configured() {
+    fn cache_aware_is_always_load_aware_for_expected_wait() {
         fn cache_aware(
             overlap_decay: f32,
             balance_token_usage_threshold: f32,
@@ -1854,13 +1878,12 @@ mod tests {
             }
         }
 
-        // Plain cache_aware consumes no backend loads — the monitor must
-        // keep skipping load polling for it.
+        // Even without pressure tuning, misses, spills, and equal-affinity
+        // ties use LeastLoad's expected-wait snapshots.
         let plain = PolicyRegistry::new(cache_aware(0.0, 1.0, 1.0));
-        assert!(plain.get_all_load_aware_policies().is_empty());
+        assert_eq!(plain.get_all_load_aware_policies().len(), 1);
 
-        // Any pressure knob makes it load-aware: waiting-prefill decay,
-        // KV-usage balance spread, or the KV-usage overload ceiling.
+        // Pressure knobs do not change that load-aware membership.
         for pressured in [
             cache_aware(1.0, 1.0, 1.0),
             cache_aware(0.0, 0.5, 1.0),

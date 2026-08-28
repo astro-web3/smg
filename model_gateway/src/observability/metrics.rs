@@ -269,6 +269,10 @@ pub(crate) fn init_metrics() {
         "smg_router_request_buffers_released_early_bytes_total",
         "Serialized size of request buffers freed at dispatch instead of response completion (retries disabled)"
     );
+    describe_counter!(
+        "smg_router_request_body_path_total",
+        "Per-request body-path decisions by path (streamed/buffered) and dominant reason"
+    );
 
     // Layer 2: Router inference metrics (gRPC only)
     describe_histogram!(
@@ -998,6 +1002,16 @@ impl Metrics {
         counter!(
             "smg_router_upstream_send_retries_total",
             "router_type" => router_type
+        )
+        .increment(1);
+    }
+
+    /// Record one per-request body-path decision with its dominant reason.
+    pub fn record_request_body_path(path: &'static str, reason: &'static str) {
+        counter!(
+            "smg_router_request_body_path_total",
+            "path" => path,
+            "reason" => reason
         )
         .increment(1);
     }
@@ -1964,6 +1978,7 @@ mod tests {
                 cache_hit_rate: 0.25,
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let rendered = render_with_recorder(|| {
@@ -1996,6 +2011,7 @@ mod tests {
                 decode_queue_reqs: Some(4),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let rendered = render_with_recorder(|| {

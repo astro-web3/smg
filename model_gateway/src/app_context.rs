@@ -722,23 +722,23 @@ impl AppContextBuilder {
             config.policy,
             PolicyConfig::CacheAware { .. } | PolicyConfig::CacheAwareLength { .. }
         ) || match &config.mode {
-                RoutingMode::PrefillDecode {
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                } => role_is_cache_aware(prefill_policy) || role_is_cache_aware(decode_policy),
-                RoutingMode::EncodePrefillDecode {
-                    encode_policy,
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                } => {
-                    role_is_cache_aware(encode_policy)
-                        || role_is_cache_aware(prefill_policy)
-                        || role_is_cache_aware(decode_policy)
-                }
-                _ => false,
-            };
+            RoutingMode::PrefillDecode {
+                prefill_policy,
+                decode_policy,
+                ..
+            } => role_is_cache_aware(prefill_policy) || role_is_cache_aware(decode_policy),
+            RoutingMode::EncodePrefillDecode {
+                encode_policy,
+                prefill_policy,
+                decode_policy,
+                ..
+            } => {
+                role_is_cache_aware(encode_policy)
+                    || role_is_cache_aware(prefill_policy)
+                    || role_is_cache_aware(decode_policy)
+            }
+            _ => false,
+        };
 
         if is_cache_aware {
             let monitor = Arc::new(KvEventMonitor::new(None));

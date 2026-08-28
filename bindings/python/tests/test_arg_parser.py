@@ -1523,7 +1523,6 @@ class TestRouterArgsFieldOrder:
         "selection_temperature",
         "upstream_pool_idle_timeout_secs",
         "least_load_max_waiting_requests",
-        "stream_request_bodies_over",
         "stream_body_stall_timeout_secs",
         "routing_key_headers",
         "cache_boundaries",
@@ -1540,6 +1539,7 @@ class TestRouterArgsFieldOrder:
         "long_pool_max_load",
         "short_pool_max_load",
         "long_prefill_indices",
+        "max_buffered_request_bytes",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1562,7 +1562,6 @@ class TestRouterArgsFieldOrder:
             "selection_temperature",
             "upstream_pool_idle_timeout_secs",
             "least_load_max_waiting_requests",
-            "stream_request_bodies_over",
             "stream_body_stall_timeout_secs",
             "routing_key_headers",
             "cache_boundaries",
@@ -1577,6 +1576,7 @@ class TestRouterArgsFieldOrder:
             "long_pool_max_load",
             "short_pool_max_load",
             "long_prefill_indices",
+            "max_buffered_request_bytes",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

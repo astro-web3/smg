@@ -107,10 +107,7 @@ impl CacheAwareLengthPolicy {
         });
         let inner = CacheAwarePolicy::with_config(config.base.clone())
             .with_no_cache_strategy(strategy as Arc<dyn NoCacheStrategy>);
-        Self {
-            inner,
-            config,
-        }
+        Self { inner, config }
     }
 
     // --- Delegated setters (forward to inner CacheAwarePolicy) ---
@@ -178,13 +175,13 @@ impl NoCacheStrategy for LengthStrategy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
         healthy_indices: &[usize],
-        min_load_idx: Option<usize>,
+        expected_wait_idx: Option<usize>,
         _avg_load: f64,
         _model_id: &str,
         uncached_hint: Option<UncachedHint>,
     ) -> Option<usize> {
         if healthy_indices.is_empty() {
-            return min_load_idx;
+            return expected_wait_idx;
         }
 
         // Compute uncached prefill tokens by priority:
@@ -193,13 +190,12 @@ impl NoCacheStrategy for LengthStrategy {
         // 1. X-Prompt-Tokens header (exact).
         // 2. info.tokens length (token-only gRPC).
         // 3. input_chars / chars_per_token (char estimate).
-        // 4. None → all-healthy min-load.
-        let uncached_tokens =
-            self.compute_uncached_tokens(info, uncached_hint);
+        // 4. None → all-healthy expected-wait winner.
+        let uncached_tokens = self.compute_uncached_tokens(info, uncached_hint);
 
         let Some(uncached) = uncached_tokens else {
-            // Neither source computable → all-healthy min-load.
-            return min_load_idx;
+            // Neither source computable → all-healthy expected-wait winner.
+            return expected_wait_idx;
         };
 
         // Split healthy workers into long/short pools by label, capturing
@@ -225,15 +221,27 @@ impl NoCacheStrategy for LengthStrategy {
             .collect();
 
         let selected = if uncached >= self.long_prefill_threshold {
-            self.select_long_request(workers, &long_pool, &short_pool, min_load_idx, uncached)
+            self.select_long_request(
+                workers,
+                &long_pool,
+                &short_pool,
+                expected_wait_idx,
+                uncached,
+            )
         } else {
-            self.select_short_request(workers, &long_pool, &short_pool, min_load_idx, uncached)
+            self.select_short_request(
+                workers,
+                &long_pool,
+                &short_pool,
+                expected_wait_idx,
+                uncached,
+            )
         };
 
-        // The inner policy's caller (select_worker_min_load, the tree
-        // closures, or hash_min_load) handles tree update +
-        // increment_processed for the returned index.
-        selected.or(min_load_idx)
+        // The inner policy's caller (select_worker_fallback, the tree
+        // closures, hash_expected_wait, or select_worker_event_driven) handles
+        // tree update for the returned index.
+        selected.or(expected_wait_idx)
     }
 }
 
@@ -283,7 +291,7 @@ impl LengthStrategy {
         workers: &[Arc<dyn Worker>],
         long_pool: &[(usize, usize, usize)],
         short_pool: &[(usize, usize, usize)],
-        min_load_idx: Option<usize>,
+        expected_wait_idx: Option<usize>,
         uncached: usize,
     ) -> Option<usize> {
         if pool_has_free(long_pool, self.long_pool_max_load) {
@@ -318,12 +326,12 @@ impl LengthStrategy {
             );
             return Some(idx);
         }
-        // Long pool fully unhealthy and short pool busy: all-healthy min-load.
+        // Long pool fully unhealthy and short pool busy: all-healthy expected-wait winner.
         info!(
             uncached,
-            "cache_aware_length: long request → all-healthy min-load (both pools exhausted)"
+            "cache_aware_length: long request → all-healthy expected-wait (both pools exhausted)"
         );
-        min_load_idx
+        expected_wait_idx
     }
 
     /// Short request (uncached < long_prefill_threshold).
@@ -332,7 +340,7 @@ impl LengthStrategy {
         workers: &[Arc<dyn Worker>],
         long_pool: &[(usize, usize, usize)],
         short_pool: &[(usize, usize, usize)],
-        min_load_idx: Option<usize>,
+        expected_wait_idx: Option<usize>,
         uncached: usize,
     ) -> Option<usize> {
         if pool_has_free(short_pool, self.short_pool_max_load) {
@@ -380,12 +388,12 @@ impl LengthStrategy {
             );
             return Some(idx);
         }
-        // Both pools empty: all-healthy min-load.
+        // Both pools empty: all-healthy expected-wait winner.
         info!(
             uncached,
-            "cache_aware_length: short request → all-healthy min-load (both pools empty)"
+            "cache_aware_length: short request → all-healthy expected-wait (both pools empty)"
         );
-        min_load_idx
+        expected_wait_idx
     }
 }
 
@@ -406,7 +414,9 @@ fn pool_has_free(pool: &[(usize, usize, usize)], max_load: usize) -> bool {
 
 /// Return the worker index of an idle (`load == 0`) entry, if any.
 fn pool_idle_worker(pool: &[(usize, usize, usize)]) -> Option<usize> {
-    pool.iter().find(|(_, load, _)| *load == 0).map(|(idx, _, _)| *idx)
+    pool.iter()
+        .find(|(_, load, _)| *load == 0)
+        .map(|(idx, _, _)| *idx)
 }
 
 /// Lowest-load worker in `pool` with the `(load, processed, idx)` tie-break.
